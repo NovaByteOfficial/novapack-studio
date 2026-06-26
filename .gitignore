@@ -1,0 +1,27 @@
+# Source — not public
+src/
+index.html
+studio-inject.js
+build.mjs
+
+# Dependencies
+node_modules/
+runtime/nbosp/node_modules/
+
+# Build outputs
+dist/
+.build-staging/
+.nw-cache/
+cache/
+out/
+
+# Runtime artifacts
+runtime/nbosp/server.log
+runtime/nbosp/cert.*
+runtime/nbosp/ca.*
+runtime/nbosp/.env
+runtime/nbosp/data/
+
+# Logs
+v8.log
+*.log
