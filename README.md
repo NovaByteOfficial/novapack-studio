@@ -28,9 +28,15 @@
 
 ## What is NovaByte Studio
 
-NovaByte Studio is a desktop app (built on NW.js) for creating, building, and packaging `.novaapp` applications. It gives you a GUI to scaffold new projects from templates, edit your manifest, manage permissions, build your package, and inspect the output — all without touching a CLI. Apps built with Studio run on Windows (x64), macOS (x64), and Linux (x64). Pre-built binaries are available on the [Releases](https://github.com/NovaByteTeam/novabyte-studio/releases) page.
+NovaByte Studio is a desktop app (built on NW.js) for creating, building, and packaging `.novaapp` applications. It gives you a GUI to scaffold new projects from templates, edit your manifest, manage permissions, build your package, and inspect the output — all without touching a CLI.
 
 Apps you build with Studio run on NovaByte OS v3 and every NBOSP fork. The `.novaapp` format is the same across all of them.
+
+---
+
+## Download
+
+NovaByte Studio is available for Windows, macOS, and Linux. Download the latest release for your platform from the [Releases](https://github.com/NovaByteTeam/novabyte-studio/releases) page, extract the archive, and run the executable — no install required.
 
 ---
 
@@ -38,25 +44,7 @@ Apps you build with Studio run on NovaByte OS v3 and every NBOSP fork. The `.nov
 
 ### Prerequisites
 
-- Node.js 22+
 - Basic HTML, CSS, and JavaScript knowledge
-
-### Install and run
-
-```bash
-npm install
-npm start
-```
-
-That's it. Studio opens as a desktop window. From there you can create a new project, pick a template, fill in your manifest, and hit Build.
-
-To build a distributable binary for Windows, macOS, or Linux:
-
-```bash
-npm run build
-```
-
-Output lands in `dist/`.
 
 ### Available templates
 
