@@ -2,7 +2,7 @@
 
 <div><img src="./logo.svg" width="100" height="100" alt="NovaByte Logo" /></div>
 
-<div><img src="https://img.shields.io/badge/NovaByte_Studio-v1.0.0-22c55e?style=for-the-badge" alt="NovaByte Studio"/></div>
+<div><img src="https://img.shields.io/badge/NovaByte_Studio-v1.1.0-22c55e?style=for-the-badge" alt="NovaByte Studio"/></div>
 
 # NovaByte Studio
 
@@ -28,7 +28,7 @@
 
 ## What is NovaByte Studio
 
-NovaByte Studio is a desktop app (built on NW.js) for creating, building, and packaging `.novaapp` applications. It gives you a GUI to scaffold new projects from templates, edit your manifest, manage permissions, build your package, and inspect the output — all without touching a CLI.
+NovaByte Studio is a desktop IDE (built on NW.js) for creating, building, and packaging `.novaapp` applications. It gives you a GUI to scaffold new projects from templates, edit your code with a full-featured CodeMirror 6 editor, manage your manifest and permissions, build your package, and inspect the output — all without touching a CLI.
 
 Apps you build with Studio run on NovaByte OS v3 and every NBOSP fork. The `.novaapp` format is the same across all of them.
 
@@ -55,6 +55,9 @@ NovaByte Studio is available for Windows, macOS, and Linux. Download the latest 
 | `utility` | File-access tool with fs permission wiring |
 | `game` | Canvas game skeleton with game loop |
 | `dashboard` | Data widget grid with live update pattern |
+| `form` | Data entry form with local JSON persistence |
+| `markdown-viewer` | Live markdown preview with vendor library support |
+| `chat` | Message list UI — client-side state, no permissions needed |
 
 ### Bundled external dependencies (`vendor/`)
 
@@ -169,6 +172,30 @@ When you hit Build in Studio, here's what happens under the hood:
 - Reads every file in the project directory and Base64-encodes it
 - Generates a SHA-256 signature over the manifest + files payload
 - Writes `<app.id>.novaapp` to your chosen output directory
+
+---
+
+## Editor
+
+NovaByte Studio includes a full-featured CodeMirror 6 editor with:
+
+- **Multi-tab editing** — VS Code-style pinned/preview tabs with dirty indicators
+- **Syntax highlighting** — JavaScript, TypeScript, HTML, CSS, JSON, Markdown and more
+- **TypeScript intellisense** — in-process type-aware completion, hover, and linting via `@typescript/vfs` (no server required)
+- **Find / Replace** — search panel with next/previous/replace/replace-all
+- **Diff / merge view** — side-by-side file comparison
+- **Image preview** — inline preview for PNG, JPG, SVG, WebP, ICO
+- **Settings** — configurable font size, tab size, and word wrap, persisted per-user
+- **Git integration** — file tree badges for modified, added, deleted, and untracked files
+- **Context menu** — rename, duplicate, delete, new file/folder, compare files
+- **Command palette** — quick access to every action (`Ctrl+Shift+P`)
+- **Quick open** — jump to any file (`Ctrl+P`)
+- **Global search** — search across all files in the project
+- **Workspaces** — save and restore open file sets per project
+
+### Themes
+
+Seven built-in themes: NovaByte Dark, NovaByte Light, Midnight Blue, Amber, Nightshade, High Contrast, and Forest.
 
 ---
 
