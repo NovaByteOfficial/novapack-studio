@@ -610,11 +610,45 @@ A standard (non-obfuscated) `.novaapp` file is plain JSON:
     "index.html": "<base64-encoded content>",
     "app.js": "<base64-encoded content>"
   },
-  "signature": "<sha256 hex string>"
+  "signature": "<Ed25519 signature, base64url>",
+  "signer": "NovaByte Trusted Signing"
 }
 ```
 
-File contents are Base64-encoded. The signature is a SHA-256 hash over the `novabyte_app`, `manifest`, `files`, and `compiled_at` fields. The runtime verifies this on install and warns the user if it doesn't match — it doesn't block installation outright.
+File contents are Base64-encoded. `signature` is an Ed25519 signature over the `novabyte_app`, `manifest`, `files`, and `compiled_at` fields — not a plain checksum. A checksum only tells you a file wasn't corrupted in transit; it says nothing about who produced it, since anyone can compute a new one after modifying the package. A signature can only be produced by whoever holds the matching private key, which is what makes trust meaningful.
+
+### Trust signing
+
+Signed doesn't automatically mean trusted. The runtime checks two separate things on install:
+
+1. **Is the signature valid?** — does it verify against the public key that produced it.
+2. **Is that public key the one the OS trusts?** — `trust-store.js` currently trusts exactly one key: NovaByte's own. That key is held offline and is not distributed to developers, so you can't get your own key into the trust store — only NovaByte can sign something as Verified.
+
+An app can carry a perfectly valid signature from some other key — that's still reported as **Unverified**. Trust isn't about "was this signed," it's about "was this signed with the one key the OS actually trusts."
+
+> **Why not a shared secret?** An earlier revision signed packages with HMAC-SHA256 using a shared secret — the same key typed into both the signing tool and every installer. That only proves a package wasn't altered after the key was typed in; it can't prove *who* signed it, since anyone holding the key (which has to be shared to verify anything) can forge arbitrary packages. Worse, one install path had a fallback that accepted `signature === sha256(payload)` — the "signature" was just a hash the installer recomputed from the package's own contents, which any attacker can do for their own unmodified payload. It verified nothing about origin. Ed25519 public/private key signing fixes this structurally: the private key never leaves the signer, only the public key ships in the trust store, and a valid signature can only have been produced by whoever holds the matching private key.
+
+**How an app gets the Verified badge:**
+
+1. A developer submits their built `.novaapp` to NovaByte.
+2. It's reviewed manually — permissions, code, local malware/AV scanning — on a machine that never touches the network. This is a manual process today, not an automated queue or enforced pipeline in code.
+3. If it passes, NovaByte signs it locally with the one trusted private key.
+4. The signed package is self-verified against its own public key as a sanity check before shipping back — a signature that doesn't verify is treated as worse than no signature.
+
+**Self-signing** — you can sign your own `.novaapp` with your own keypair for local testing. It'll always show as **Unverified**, since no key but NovaByte's is in the trust store. Self-signing proves the package hasn't been tampered with since you signed it; it doesn't and can't confer NovaByte's review.
+
+**Revocation** — trust can be pulled from one specific signed package after the fact, by its exact signature, without touching the signing key itself or any other package that key ever signed. A few things worth knowing:
+
+- Revocation is keyed by the exact signature string, not by app id/name/version — those fields are dev-controlled and could be reused or spoofed, whereas a signature is a fixed value only producible once, at sign time.
+- Revoking a signature does **not** revoke the key — every other package signed with that key stays trusted. If the private key itself is ever compromised, that's a different, more drastic case: revoking individual signatures isn't enough, the trust store entry itself needs to be replaced and everything re-signed.
+- Revocations persist to disk (`revoked-signatures.json`) and apply across every NBOSP process on that machine, not just the one that revoked it. A mistaken revocation can be undone.
+
+**What the user sees:**
+
+- **Verified** — signed with NovaByte's trusted key, not revoked. Installs normally.
+- **Unverified** — unsigned, self-signed, signed with any other key, or individually revoked. The install still proceeds, but the OS shows a clear warning first so the user can back out if they don't recognize the source.
+
+Unverified doesn't mean blocked — NBOSP doesn't gatekeep what you can run on your own machine. It means the OS is telling you the truth about what it can and can't vouch for, and leaving the decision with you.
 
 ---
 
@@ -624,11 +658,7 @@ File contents are Base64-encoded. The signature is a SHA-256 hash over the `nova
 
 Share the `.novaapp` file directly. Users drag and drop it into the App Manager, or click Install and pick the file. That's the whole install flow — no separate installer, no admin rights required.
 
-Provide a checksum alongside the file so users can verify integrity before installing:
-
-```bash
-sha256sum com.example.myapp.novaapp
-```
+If your app has been submitted and signed by NovaByte (see [Trust signing](#trust-signing) above), it'll show the Verified badge automatically when users install it. Unverified packages still install, but with a warning — worth getting your app reviewed and signed before wide distribution if you want that badge.
 
 ### Updates
 
