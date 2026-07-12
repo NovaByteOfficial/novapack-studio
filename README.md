@@ -399,20 +399,27 @@ window.parent.postMessage({ type: 'nova:fs:write', path: '/docs/notes.txt', cont
 window.parent.postMessage({ type: 'nova:fs:delete', path: '/docs/notes.txt' }, '*');
 ```
 
-### Notifications — `nova:notify:*`
+### Notifications — `nova:notifications:*`
 
 ```javascript
 // Show a notification (requires device:notifications)
 window.parent.postMessage({
-  type: 'nova:notify:show',
-  title: 'Done',
-  body: 'Your file was saved.',
-  appName: 'My App'
+  type: 'nova:notifications:show',
+  requestId: crypto.randomUUID(),
+  payload: {
+    title: 'Done',
+    body: 'Your file was saved.',
+  },
 }, '*');
+// Response: { result: { success: true } }
 
 // Clear all notifications (requires device:notifications)
-window.parent.postMessage({ type: 'nova:notify:clear' }, '*');
+window.parent.postMessage({ type: 'nova:notifications:clear', requestId: crypto.randomUUID() }, '*');
 ```
+
+Optional `payload` fields, sanitized/clamped by the OS gateway before display — invalid values silently fall back rather than erroring: `type` (`'info' | 'success' | 'warning' | 'error'`, default `'info'`), `icon` (name from the OS icon set, default none), `action` (one of a small set of built-in action strings, e.g. `'open-settings'`), `actionLabel` (label for that action button). `title` and `body` are length-capped server-side.
+
+Rate limited to 10 notifications per app per minute. Once exceeded, further calls get back `{ error: { code: 'RATE_LIMITED' } }` until the window rolls over.
 
 ### Clipboard — `nova:clipboard:*`
 
@@ -536,6 +543,8 @@ window.parent.postMessage({
 | `NOT_FOUND` | File or resource not found |
 | `QUOTA_EXCEEDED` | Storage limit reached |
 | `NETWORK_ERROR` | Fetch failed |
+| `RATE_LIMITED` | Too many calls to a rate-limited API in the current window (e.g. notifications) |
+| `UNAVAILABLE` | The underlying OS service isn't available (e.g. headless/test environment) |
 
 ---
 
