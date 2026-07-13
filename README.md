@@ -20,7 +20,7 @@
 
 <br>
 
-[**Getting Started**](#getting-started) · [**Manifest Format**](#manifest-format) · [**App Runtime**](#app-runtime) · [**Permissions**](#permissions) · [**Private Storage**](#private-storage) · [**postMessage API**](#postmessage-api) · [**Security**](#security) · [**Distribution**](#distribution)
+[**Getting Started**](#getting-started) · [**Manifest Format**](#manifest-format) · [**App Runtime**](#app-runtime) · [**Permissions**](#permissions) · [**Private Storage**](#private-storage) · [**postMessage API**](#postmessage-api) · [**Security**](#security) · [**Getting Verified**](#how-to-get-your-novaapp-verified) · [**Distribution**](#distribution)
 
 </div>
 
@@ -658,6 +658,31 @@ An app can carry a perfectly valid signature from some other key — that's stil
 - **Unverified** — unsigned, self-signed, signed with any other key, or individually revoked. The install still proceeds, but the OS shows a clear warning first so the user can back out if they don't recognize the source.
 
 Unverified doesn't mean blocked — NBOSP doesn't gatekeep what you can run on your own machine. It means the OS is telling you the truth about what it can and can't vouch for, and leaving the decision with you.
+
+### How to get your `.novaapp` Verified
+
+This is the Studio-side half of the process described above — it gets your package *into* NovaByte's review queue. Studio itself never signs anything; it only helps you package the submission for a human reviewer.
+
+1. **Build your app first.** Trusted Signing submits your *last build*, so run Build before opening the Sign tab if you haven't already.
+2. **Open the Sign tab** in Studio and find the "Submit for Trusted Signing" panel.
+3. **Fill in submitter / contact (optional).** Your name or team — helps the reviewer reach you if something needs clarifying. Not required.
+4. **Set the shared review folder path.** This is a local path to a folder synced by Google Drive for Desktop (or similar) — not a browser-only Drive tab, since Studio needs real filesystem access to write into it. You only need to set this once; Studio remembers it for future submissions. This folder is the actual handoff point between your machine and NovaByte's offline reviewer — nothing is submitted over the network directly from Studio.
+5. **Click "Submit for Review."** Studio writes your build and manifest into the shared folder's submission queue.
+6. **Wait for review.** A human reviewer checks the manifest, requested permissions, and code — this happens on a machine that never touches the network. No private key is involved until this step passes.
+7. **If it passes**, the reviewer signs it locally with NovaByte's one trusted private key, and the signed package lands back in the shared folder. Installing it will now show the Verified badge.
+8. **If it doesn't pass**, you'll hear back through the submitter contact info you provided, typically with what needs to change before resubmitting.
+
+**Checking status:** the "Submission Queue" panel on the same tab shows the status of packages you've submitted from that machine. This is read-only — it reflects status, it doesn't let you approve your own submissions, since review happens outside Studio entirely.
+
+**Troubleshooting:**
+
+| Message | Cause | Fix |
+|---------|-------|-----|
+| "No shared review folder configured" | You haven't set a path yet | Set the shared review folder path in Sign tab settings first — the queue file lives inside that folder, so nothing can be read or written without it |
+| "Submission queue file exists but couldn't be read/parsed" | The queue file is corrupted or mid-sync | Check the folder is actually synced by Drive for Desktop (not just a browser view); if it looks like a sync-conflict copy, resolve it manually before continuing |
+| Package stays "Unverified" after submitting | Review hasn't completed yet, or it didn't pass | Submitting queues it for review — it doesn't sign it. Verified only appears after a human reviewer approves and signs it |
+
+**What this step does *not* do:** submitting for review never signs anything itself, and doesn't guarantee approval. It only puts your build in front of a reviewer. The only thing that produces a Verified badge is NovaByte's offline signing step succeeding after review.
 
 ---
 
