@@ -2,7 +2,7 @@
 
 <div><img src="./logo.svg" width="100" height="100" alt="NovaByte Logo" /></div>
 
-<div><img src="https://img.shields.io/badge/NovaByte_Studio-v1.1.60-22c55e?style=for-the-badge" alt="NovaByte Studio"/></div>
+<div><img src="https://img.shields.io/badge/NovaByte_Studio-v1.1.61-22c55e?style=for-the-badge" alt="NovaByte Studio"/></div>
 
 # NovaByte Studio
 
@@ -20,7 +20,7 @@
 
 <br>
 
-[**Getting Started**](#getting-started) · [**Manifest Format**](#manifest-format) · [**App Runtime**](#app-runtime) · [**Permissions**](#permissions) · [**Private Storage**](#private-storage) · [**postMessage API**](#postmessage-api) · [**Security**](#security) · [**Getting Verified**](#how-to-get-your-novaapp-verified) · [**Distribution**](#distribution)
+[**Getting Started**](#getting-started) · [**Manifest Format**](#manifest-format) · [**App Runtime**](#app-runtime) · [**Permissions**](#permissions) · [**Private Storage**](#private-storage) · [**IPC API**](#ipc-api-windownova) · [**Security**](#security) · [**Getting Verified**](#how-to-get-your-novaapp-verified) · [**Distribution**](#distribution)
 
 </div>
 
@@ -209,7 +209,7 @@ The App Manager reads the file, validates the manifest fields (`id`, `name`, `ve
 
 ### Launch — permission gate
 
-Before the iframe loads, the runtime checks every permission in `permissions` and `optionalPermissions` against the Permission Manager. Any missing grants are queued and shown one at a time (Android-style). If the user denies a required permission, the app shows a locked screen instead of loading:
+Before the app loads, the runtime checks every permission in `permissions` and `optionalPermissions` against the Permission Manager. Any missing grants are queued and shown one at a time (Android-style). If the user denies **any** declared permission — required or optional — the app currently shows a locked screen instead of loading:
 
 ```
 🔒
@@ -217,30 +217,34 @@ This app requires additional permissions to run.
 Grant them in Settings → Apps and try again.
 ```
 
-### Launch — private storage bridge
+> **Known gap:** the intent of `optionalPermissions` is that the app should still launch (with that capability unavailable) if denied — only a denied *required* permission should block launch. That distinction isn't enforced yet; today, denying anything in either list blocks the app. If you're relying on `optionalPermissions` to mean "nice to have," be aware denial currently behaves the same as denying a required one.
 
-After permissions pass, the runtime injects a `__novaPrivateStore` shim into the iframe before the app HTML loads. This gives the app isolated, namespaced localStorage access without touching the OS's own keys:
+### Launch — sandbox
+
+Third-party apps run inside an NW.js `<webview>` element, not an iframe — a separate renderer process, not a same-document sandbox. There is no `window.parent`/`contentWindow` reference between the guest and the host (a `<webview>` guest's `window.parent` is just itself), so the two sides can't reach each other via ordinary DOM references or `postMessage`. Communication with the OS happens exclusively through `window.nova`, described below.
+
+`allow-same-origin` is **not** granted to third-party apps by default — only to an audited allowlist of first-party system apps. Granting it gives a guest access to cookies/localStorage/sessionStorage on the shared origin, which widens the impact of any XSS inside that app. If your app genuinely needs it, declare `sandbox: { allowSameOrigin: true }` in your manifest; expect this to require review before your app is verified.
+
+### Launch — window.nova bridge
+
+Before your app's HTML executes, the runtime injects `window.nova` into the guest's page. You don't need to request it, import it, or wait for a handshake — it's there as soon as your script runs:
 
 ```javascript
-// Inside your app's iframe — available immediately, no import needed
-window.__novaPrivateStore.get('myKey')        // → value or null
-window.__novaPrivateStore.set('myKey', value) // persists across launches
-window.__novaPrivateStore.del('myKey')
-window.__novaPrivateStore.getVFSDir()         // → VFS directory path for this app
-window.__novaPrivateStore.appId               // → 'com.example.myapp'
+window.nova.ipc(type, payload)        // → Promise, resolves with `result`, rejects with {code, message}
+window.nova.requestPermission(...)    // convenience wrapper around nova:request-permission
+window.nova.onEvent(eventName, cb)    // subscribe to pushed events (see Event bus below)
 ```
 
-Keys are automatically namespaced to `nova_app_<appId>_<key>` in localStorage — your app can never accidentally read or overwrite another app's data.
+The `nova:ready` handshake (app metadata + granted permissions) now fires automatically on load — you don't need to send it yourself. If you want the result (e.g. to check what was actually granted), call it directly and use the response:
 
-### Launch — iframe sandbox
-
-The app HTML runs in a sandboxed iframe with:
-
-```
-sandbox="allow-scripts allow-forms allow-popups allow-modals allow-same-origin"
+```javascript
+const info = await window.nova.ipc('nova:ready', {});
+console.log(info.permissions, info.optionalPermissions);
 ```
 
-There is no access to the parent window's DOM or JS scope. Communication with the OS happens exclusively through the postMessage API.
+`window.fetch` and `XMLHttpRequest` inside your app are also transparently routed through this bridge — plain `fetch(url, opts)` calls work as expected and don't need to be rewritten to use `nova.ipc` directly, as long as the relevant `net:*` permission is granted.
+
+There is no `window.__novaPrivateStore` — for isolated, namespaced storage, use `nova:storage:*` (see [Storage](#storage-novastorage) below), which is backed by the host, not raw `localStorage` inside the guest.
 
 ---
 
@@ -294,20 +298,20 @@ Required permissions — all must be granted or the app won't load. Optional per
 
 ### Requesting a permission at runtime
 
-From inside your sandboxed app, send a postMessage request:
+Use the `window.nova.requestPermission` convenience wrapper (or call `nova.ipc('nova:request-permission', ...)` directly — they're equivalent):
 
 ```javascript
-window.parent.postMessage({
-  type: 'nova:request-permission',
+const { granted } = await window.nova.requestPermission('fs:write', 'Needed to save your documents.');
+console.log(granted); // true or false
+```
+
+`permanent` defaults to `true` (grant persists) unless explicitly set to `false`. The convenience wrapper above doesn't expose it — if you need a one-time, non-persistent grant, call `nova.ipc` directly instead:
+
+```javascript
+const { granted } = await window.nova.ipc('nova:request-permission', {
   permission: 'fs:write',
   reason: 'Needed to save your documents.',
-  permanent: true
-}, '*');
-
-window.addEventListener('message', (e) => {
-  if (e.data.type === 'nova:request-permission:response') {
-    console.log(e.data.granted); // true or false
-  }
+  permanent: false,
 });
 ```
 
@@ -315,72 +319,48 @@ window.addEventListener('message', (e) => {
 
 ## Private Storage
 
-Every app gets isolated storage through `window.__novaPrivateStore`, injected by the runtime before the iframe loads. Use it instead of touching `localStorage` directly — direct localStorage access will work but keys won't be namespaced, which can conflict with OS data.
+There is no `window.__novaPrivateStore` object injected into your app. Isolated, per-app key-value storage is provided host-side via `nova:storage:*` over the `window.nova.ipc` bridge:
 
 ```javascript
-// Store data
-window.__novaPrivateStore.set('settings', { theme: 'dark', fontSize: 14 });
-
-// Read data
-const settings = window.__novaPrivateStore.get('settings'); // → { theme: 'dark', fontSize: 14 }
-
-// Delete a key
-window.__novaPrivateStore.del('settings');
-
-// Get your app's VFS directory path (for file system operations)
-const dir = window.__novaPrivateStore.getVFSDir();
+await window.nova.ipc('nova:storage:set', { key: 'settings', value: JSON.stringify({ theme: 'dark' }) });
+const { value } = await window.nova.ipc('nova:storage:get', { key: 'settings' });
+await window.nova.ipc('nova:storage:delete', { key: 'settings' });
 ```
 
-Data persists across app launches and OS restarts. It is scoped to your app ID — `nova_app_com.example.myapp_settings` — and completely invisible to other apps.
+See [Storage — `nova:storage:*`](#storage-novastorage) below for the full reference. Keys are namespaced per app ID host-side — your app can never read or overwrite another app's data, and there's no separate namespacing scheme to remember on your end.
 
 ---
 
-## postMessage API
+## IPC API — `window.nova`
 
-Apps communicate with the OS via `postMessage`. Every call follows the same request/response pattern:
-
-**Sending a request:**
+Apps communicate with the OS via `window.nova.ipc(type, payload)`, injected automatically before your app's script runs — no import, no handshake required to start using it.
 
 ```javascript
-window.parent.postMessage({
-  type: 'nova:<category>:<action>',
-  // ... payload fields
-}, '*');
-```
-
-**Receiving the response:**
-
-```javascript
-window.addEventListener('message', (e) => {
-  if (e.data.type === 'nova:<category>:<action>:response') {
-    if (e.data.error) {
-      console.error(e.data.error.code, e.data.error.message);
-    } else {
-      console.log(e.data.result);
-    }
-  }
-});
+try {
+  const result = await window.nova.ipc('nova:<category>:<action>', {
+    // ... payload fields
+  });
+  console.log(result);
+} catch (err) {
+  // err.code and err.message are set for IPC-level errors (see Error codes below)
+  console.error(err.code, err.message);
+}
 ```
 
 ### Handshake — `nova:ready`
 
-Send this on startup. The OS responds with your app's metadata and granted permissions.
+This now fires automatically on load — you don't need to send it yourself. Call it directly if you want the response (your app's metadata and granted permissions):
 
 ```javascript
-window.parent.postMessage({
-  type: 'nova:ready',
-  appId: 'com.example.myapp'
-}, '*');
-
-// Response
-{
-  success: true,
-  appId: 'com.example.myapp',
-  permissions: ['fs:read', 'device:notifications'],
-  optionalPermissions: ['net:external'],
-  osVersion: '3.0.0',
-  securityPatch: '2026-05-01'
-}
+const info = await window.nova.ipc('nova:ready', {});
+// {
+//   success: true,
+//   appId: 'com.example.myapp',
+//   permissions: ['fs:read', 'device:notifications'],
+//   optionalPermissions: ['net:external'],
+//   osVersion: '3.0.0',
+//   securityPatch: '2026-05-01'
+// }
 ```
 
 ### Filesystem — `nova:fs:*`
@@ -389,152 +369,136 @@ All filesystem operations require the appropriate `fs:*` permission.
 
 ```javascript
 // Read a file (requires fs:read)
-window.parent.postMessage({ type: 'nova:fs:read', path: '/docs/notes.txt' }, '*');
-// Response: { result: { content: '...', size: 1234, modified: '...' } }
+const { content, size, modified } = await window.nova.ipc('nova:fs:read', { path: '/docs/notes.txt' });
 
 // Write a file (requires fs:write)
-window.parent.postMessage({ type: 'nova:fs:write', path: '/docs/notes.txt', content: 'Hello' }, '*');
+await window.nova.ipc('nova:fs:write', { path: '/docs/notes.txt', content: 'Hello' });
 
 // Delete a file (requires fs:delete)
-window.parent.postMessage({ type: 'nova:fs:delete', path: '/docs/notes.txt' }, '*');
+await window.nova.ipc('nova:fs:delete', { path: '/docs/notes.txt' });
 ```
 
 ### Notifications — `nova:notifications:*`
 
 ```javascript
 // Show a notification (requires device:notifications)
-window.parent.postMessage({
-  type: 'nova:notifications:show',
-  requestId: crypto.randomUUID(),
-  payload: {
-    title: 'Done',
-    body: 'Your file was saved.',
-  },
-}, '*');
-// Response: { result: { success: true } }
-
-// Clear all notifications (requires device:notifications)
-window.parent.postMessage({ type: 'nova:notifications:clear', requestId: crypto.randomUUID() }, '*');
+const res = await window.nova.ipc('nova:notifications:show', {
+  title: 'Done',
+  body: 'Your file was saved.',
+});
+// { success: true }
 ```
 
-Optional `payload` fields, sanitized/clamped by the OS gateway before display — invalid values silently fall back rather than erroring: `type` (`'info' | 'success' | 'warning' | 'error'`, default `'info'`), `icon` (name from the OS icon set, default none), `action` (one of a small set of built-in action strings, e.g. `'open-settings'`), `actionLabel` (label for that action button). `title` and `body` are length-capped server-side.
+> **Known gap:** `nova:notifications:clear` currently returns `{ code: 'UNAVAILABLE', message: 'Notification service not available' }` — the clear-all path was stubbed and never wired up to the underlying notification service. Showing notifications works; clearing them doesn't yet.
 
-Rate limited to 10 notifications per app per minute. Once exceeded, further calls get back `{ error: { code: 'RATE_LIMITED' } }` until the window rolls over.
+Optional fields on `nova:notifications:show`, sanitized/clamped by the OS gateway before display — invalid values silently fall back rather than erroring: `type` (`'info' | 'success' | 'warning' | 'error'`, default `'info'`), `icon` (name from the OS icon set, default none), `action` (one of a small set of built-in action strings, e.g. `'open-settings'`), `actionLabel` (label for that action button). `title` and `body` are length-capped server-side.
+
+Rate limited to 10 notifications per app per minute. Once exceeded, further calls reject with `{ code: 'RATE_LIMITED' }` until the window rolls over.
 
 ### Clipboard — `nova:clipboard:*`
 
 ```javascript
 // Read clipboard (requires fs:read)
-window.parent.postMessage({ type: 'nova:clipboard:read' }, '*');
-// Response: { result: { text: '...' } }
+const { text } = await window.nova.ipc('nova:clipboard:read', {});
 
 // Write clipboard (requires fs:read)
-window.parent.postMessage({ type: 'nova:clipboard:write', text: 'Hello' }, '*');
+await window.nova.ipc('nova:clipboard:write', { text: 'Hello' });
 ```
 
 ### Window — `nova:window:*`
 
 ```javascript
-// Close this window
-window.parent.postMessage({ type: 'nova:window:close' }, '*');
+await window.nova.ipc('nova:window:close', {});
+await window.nova.ipc('nova:window:minimize', {});
+await window.nova.ipc('nova:window:maximize', {});
+await window.nova.ipc('nova:window:setTitle', { title: 'My App — Editing' });
+await window.nova.ipc('nova:window:resize', { width: 1200, height: 800 });
 
-// Minimize
-window.parent.postMessage({ type: 'nova:window:minimize' }, '*');
-
-// Maximize / restore
-window.parent.postMessage({ type: 'nova:window:maximize' }, '*');
-
-// Set title
-window.parent.postMessage({ type: 'nova:window:setTitle', title: 'My App — Editing' }, '*');
-
-// Resize
-window.parent.postMessage({ type: 'nova:window:resize', width: 1200, height: 800 }, '*');
-
-// Get current state
-window.parent.postMessage({ type: 'nova:window:getState' }, '*');
-// Response: { result: { width, height, x, y, maximized, minimized } }
+const state = await window.nova.ipc('nova:window:getState', {});
+// { width, height, x, y, maximized, minimized }
 ```
 
 ### App launcher — `nova:app:*`
 
 ```javascript
 // Launch another app (requires system:apps)
-window.parent.postMessage({ type: 'nova:app:launch', appId: 'com.example.otherapp' }, '*');
+await window.nova.ipc('nova:app:launch', { appId: 'com.example.otherapp' });
 
 // Get info about an app (requires system:apps)
-window.parent.postMessage({ type: 'nova:app:info', appId: 'com.example.otherapp' }, '*');
+const info = await window.nova.ipc('nova:app:info', { appId: 'com.example.otherapp' });
 ```
 
-### Network — `nova:net:fetch`
+### Network — `fetch()` / `nova:net:fetch`
+
+You generally don't need to call `nova:net:fetch` directly — `window.fetch` and `XMLHttpRequest` inside your app are already routed through the bridge, so plain `fetch(url, opts)` works as-is once the relevant `net:*` permission is granted:
 
 ```javascript
-// External request (requires net:external)
-window.parent.postMessage({
-  type: 'nova:net:fetch',
-  url: 'https://api.example.com/data',
-  method: 'GET',
-  headers: { 'Accept': 'application/json' }
-}, '*');
+// Requires net:external (or net:internal for same-origin requests)
+const res = await fetch('https://api.example.com/data', {
+  headers: { 'Accept': 'application/json' },
+});
+const data = await res.json();
 ```
 
 ### Geolocation — `nova:device:geolocation`
 
 ```javascript
 // Requires device:geolocation
-window.parent.postMessage({ type: 'nova:device:geolocation' }, '*');
-// Response: { result: { latitude, longitude, accuracy } }
+const { latitude, longitude, accuracy } = await window.nova.ipc('nova:device:geolocation', {});
 ```
 
 ### System info — `nova:system:info`
 
 ```javascript
 // Requires system:info
-window.parent.postMessage({ type: 'nova:system:info' }, '*');
-// Response: { result: { osVersion, securityPatch, platform, ... } }
+const info = await window.nova.ipc('nova:system:info', {});
+// { osVersion, securityPatch, platform, ... }
 ```
 
 ### Event bus — `nova:events:*`
 
-```javascript
-// Subscribe to an OS event
-window.parent.postMessage({ type: 'nova:events:subscribe', event: 'theme:change' }, '*');
+Use `window.nova.onEvent`, which handles the subscribe call and dispatches pushed events to your callback:
 
-// Unsubscribe
-window.parent.postMessage({ type: 'nova:events:unsubscribe', event: 'theme:change' }, '*');
+```javascript
+window.nova.onEvent('theme:change', (data) => {
+  console.log('theme changed:', data);
+});
 ```
+
+Calling `nova.ipc('nova:events:unsubscribe', { event: 'theme:change' })` directly still works if you need to unsubscribe explicitly.
 
 ### Storage — `nova:storage:*`
 
-Per-app key-value storage via the OS bridge (alternative to `__novaPrivateStore`):
+Per-app key-value storage via the OS bridge (there is no `__novaPrivateStore` — see [Private Storage](#private-storage) above):
 
 ```javascript
-window.parent.postMessage({ type: 'nova:storage:set', key: 'myKey', value: 'myValue' }, '*');
-window.parent.postMessage({ type: 'nova:storage:get', key: 'myKey' }, '*');
-window.parent.postMessage({ type: 'nova:storage:delete', key: 'myKey' }, '*');
-window.parent.postMessage({ type: 'nova:storage:clear' }, '*');
-window.parent.postMessage({ type: 'nova:storage:keys' }, '*');
+await window.nova.ipc('nova:storage:set', { key: 'myKey', value: 'myValue' });
+const { value } = await window.nova.ipc('nova:storage:get', { key: 'myKey' });
+await window.nova.ipc('nova:storage:delete', { key: 'myKey' });
+await window.nova.ipc('nova:storage:clear', {});
+const { keys } = await window.nova.ipc('nova:storage:keys', {});
 ```
 
 ### File picker — `nova:dialog:*`
 
 ```javascript
-// Open file picker
-window.parent.postMessage({
-  type: 'nova:dialog:open',
+// Open file picker (requires fs:read)
+const file = await window.nova.ipc('nova:dialog:open', {
   accept: ['.txt', '.md'],
-  multiple: false
-}, '*');
-// Response: { result: { path, name, content } }
+  multiple: false,
+});
+// { path, name, content }
 
-// Save file picker
-window.parent.postMessage({
-  type: 'nova:dialog:save',
+// Save file picker (requires fs:write)
+await window.nova.ipc('nova:dialog:save', {
   filename: 'notes.txt',
-  content: 'Hello'
-}, '*');
+  content: 'Hello',
+});
 ```
 
 ### Error codes
+
+`window.nova.ipc` rejects (throws) rather than resolving with an `{ error }` field — always wrap calls in `try/catch` or attach `.catch()`. The thrown error has `.code` and `.message` set:
 
 | Code | Meaning |
 |------|---------|
@@ -544,11 +508,12 @@ window.parent.postMessage({
 | `QUOTA_EXCEEDED` | Storage limit reached |
 | `NETWORK_ERROR` | Fetch failed |
 | `RATE_LIMITED` | Too many calls to a rate-limited API in the current window (e.g. notifications) |
-| `UNAVAILABLE` | The underlying OS service isn't available (e.g. headless/test environment) |
+| `UNAVAILABLE` | The underlying OS service isn't available (e.g. headless/test environment, or a stubbed-but-unwired feature like `nova:notifications:clear`) |
 
 ---
 
 ## Security
+
 
 ### Security Update API
 
@@ -574,26 +539,7 @@ Apps can declare a minimum OS security patch level required to run. The OS check
 
 If the user's OS patch is older than required, an unskippable dialog appears with a 6-second countdown and closes the window automatically. The user is directed to Settings → Updates. The dialog cannot be dismissed or bypassed.
 
-**Trigger a security check from inside your app:**
-
-```javascript
-// Useful for protecting specific actions like unlocking a vault
-window.parent.postMessage({
-  type: 'nova:security:check',
-  minPatchDate: '2026-05-01',
-  reason: 'Required to store encrypted passwords safely.'
-}, '*');
-
-window.addEventListener('message', (e) => {
-  if (e.data.type === 'nova:security:result') {
-    console.log(e.data.compliant); // true or false
-    console.log(e.data.current);   // '2026-05-01'
-    console.log(e.data.required);  // '2026-05-01'
-    // If compliant is false, the OS already showed the blocking dialog
-    // and closed the window — you don't need to handle it yourself
-  }
-});
-```
+> **Not implemented in NBOSP:** an in-app trigger to re-check security compliance on demand (`nova:security:check`) was stubbed at one point and later removed. The launch-time `minSecurityPatch` enforcement described above is real and still runs automatically — there's just no runtime API to trigger it manually mid-session. If you need to gate a specific in-app action (like unlocking a vault) on OS patch level, do it via `nova:system:info` and compare `securityPatch` yourself; there's no dedicated helper for it right now.
 
 ### Best practices
 
