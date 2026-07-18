@@ -209,15 +209,9 @@ The App Manager reads the file, validates the manifest fields (`id`, `name`, `ve
 
 ### Launch — permission gate
 
-Before the app loads, the runtime checks every permission in `permissions` and `optionalPermissions` against the Permission Manager. Any missing grants are queued and shown one at a time (Android-style). If the user denies **any** declared permission — required or optional — the app currently shows a locked screen instead of loading:
+Before the app loads, the runtime checks every permission in `permissions` against the Permission Manager. Missing grants are queued and shown one at a time (Android-style). Previously, denying any declared permission — required or optional — blocked launch behind a locked screen. **That's no longer the case: denying a required permission no longer blocks launch either.** The app launches regardless of grant state, and it's on the app to check what it actually has (via `nova:ready`, see below) and degrade gracefully for anything it wasn't granted — including required permissions.
 
-```
-🔒
-This app requires additional permissions to run.
-Grant them in Settings → Apps and try again.
-```
-
-> **Known gap:** the intent of `optionalPermissions` is that the app should still launch (with that capability unavailable) if denied — only a denied *required* permission should block launch. That distinction isn't enforced yet; today, denying anything in either list blocks the app. If you're relying on `optionalPermissions` to mean "nice to have," be aware denial currently behaves the same as denying a required one.
+> **Note:** `optionalPermissions` are never prompted for at launch — only entries in `permissions` go through the launch-time consent queue. Users can grant optional permissions manually from Settings → Apps, or your app can request one at runtime with `window.nova.requestPermission(...)` (see below) at the point you actually need it.
 
 ### Launch — sandbox
 
@@ -294,7 +288,7 @@ Permissions are declared in `manifest.json` and checked before the app loads. Th
 }
 ```
 
-Required permissions — all must be granted or the app won't load. Optional permissions — the app must handle denial gracefully and still function in a degraded mode.
+Required permissions are prompted for at launch, but a denial no longer blocks the app from loading — the app must check what was actually granted and degrade gracefully if a required permission is missing. Optional permissions are never prompted at launch; users can grant them manually from Settings → Apps, or your app can request one at runtime with `window.nova.requestPermission(...)` and handle denial gracefully.
 
 ### Requesting a permission at runtime
 
@@ -389,9 +383,9 @@ const res = await window.nova.ipc('nova:notifications:show', {
 // { success: true }
 ```
 
-> **Known gap:** `nova:notifications:clear` currently returns `{ code: 'UNAVAILABLE', message: 'Notification service not available' }` — the clear-all path was stubbed and never wired up to the underlying notification service. Showing notifications works; clearing them doesn't yet.
+`nova:notifications:clear` clears all notifications for the calling app's session (requires `device:notifications`).
 
-Optional fields on `nova:notifications:show`, sanitized/clamped by the OS gateway before display — invalid values silently fall back rather than erroring: `type` (`'info' | 'success' | 'warning' | 'error'`, default `'info'`), `icon` (name from the OS icon set, default none), `action` (one of a small set of built-in action strings, e.g. `'open-settings'`), `actionLabel` (label for that action button). `title` and `body` are length-capped server-side.
+Optional fields on `nova:notifications:show`, sanitized/clamped by the OS gateway before display — invalid values silently fall back rather than erroring: `type` (`'info' | 'success' | 'warning' | 'error'`, default `'info'`), `icon` (name from the OS icon set, default none), `action` (one of a small set of built-in action strings, e.g. `'open-settings'`), `actionLabel` (label for that action button). `title` and `body` are length-capped server-side. The action button is clickable both on the initial toast and later from the persistent notification panel — clicking `'open-settings'`/`'settings'`/`'openSettings'` opens the Settings app.
 
 Rate limited to 10 notifications per app per minute. Once exceeded, further calls reject with `{ code: 'RATE_LIMITED' }` until the window rolls over.
 
@@ -508,7 +502,7 @@ await window.nova.ipc('nova:dialog:save', {
 | `QUOTA_EXCEEDED` | Storage limit reached |
 | `NETWORK_ERROR` | Fetch failed |
 | `RATE_LIMITED` | Too many calls to a rate-limited API in the current window (e.g. notifications) |
-| `UNAVAILABLE` | The underlying OS service isn't available (e.g. headless/test environment, or a stubbed-but-unwired feature like `nova:notifications:clear`) |
+| `UNAVAILABLE` | The underlying OS service isn't available (e.g. headless/test environment) |
 
 ---
 
