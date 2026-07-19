@@ -108,7 +108,7 @@ Every app needs a `manifest.json` at the root of its directory.
   "entry": "index.html",
   "icon": "box",
   "type": "blank",
-  "permissions": ["fs:read"],
+  "permissions": ["vfs:read"],
   "optionalPermissions": ["device:notifications"],
   "defaultSize": [800, 560],
   "minSize": [400, 300],
@@ -250,12 +250,14 @@ Permissions are declared in `manifest.json` and checked before the app loads. Th
 
 29 permissions across 8 categories. This mirrors `app-permission-manager.js` exactly — if you're hand-writing a manifest, these are the only strings `validateManifest` recognizes without a warning. (`data:export`/`data:backup`, previously listed here, don't exist as real permissions — they were dead metadata with no backing handler and have been removed from the OS entirely; the export feature in Settings isn't permission-gated.)
 
+`vfs:metadata` is worth calling out specifically: it existed in the permission registry from the start, but the handler behind it (`nova:vfs:stat`) checked `vfs:read` instead — declaring `vfs:metadata` alone in a manifest silently did nothing. That's now fixed; `vfs:metadata` genuinely gates `nova:vfs:stat` on its own (an app with `vfs:read` still works too, since full read is a superset of metadata-only access).
+
 | Permission | Category | Risk | Useful for |
 |------------|----------|------|------------|
-| `fs:read` | Filesystem | Medium | Reading files a user opens/imports |
-| `fs:write` | Filesystem | High | Saving files, exports, generated output |
-| `fs:delete` | Filesystem | Critical | File managers, cleanup tools |
-| `fs:metadata` | Filesystem | Low | Listing/sizing files without reading contents |
+| `vfs:read` | Filesystem | Medium | Reading files a user opens/imports |
+| `vfs:write` | Filesystem | High | Saving files, exports, generated output |
+| `vfs:delete` | Filesystem | Critical | File managers, cleanup tools |
+| `vfs:metadata` | Filesystem | Low | Listing/sizing files without reading contents |
 | `net:internal` | Network | Low | Calling this OS's own API/server endpoints |
 | `net:external` | Network | Medium | Calling any third-party HTTP API (REST, webhooks, AI providers) |
 | `net:websocket` | Network | Medium | Live/streaming connections (chat, realtime data feeds) |
@@ -288,7 +290,7 @@ Permissions are declared in `manifest.json` and checked before the app loads. Th
 
 ```json
 {
-  "permissions": ["fs:read", "net:internal"],
+  "permissions": ["vfs:read", "net:internal"],
   "optionalPermissions": ["device:notifications"]
 }
 ```
@@ -300,7 +302,7 @@ Required permissions are prompted for at launch, but a denial no longer blocks t
 Use the `window.nova.requestPermission` convenience wrapper (or call `nova.ipc('nova:request-permission', ...)` directly — they're equivalent):
 
 ```javascript
-const { granted } = await window.nova.requestPermission('fs:write', 'Needed to save your documents.');
+const { granted } = await window.nova.requestPermission('vfs:write', 'Needed to save your documents.');
 console.log(granted); // true or false
 ```
 
@@ -308,7 +310,7 @@ console.log(granted); // true or false
 
 ```javascript
 const { granted } = await window.nova.ipc('nova:request-permission', {
-  permission: 'fs:write',
+  permission: 'vfs:write',
   reason: 'Needed to save your documents.',
   permanent: false,
 });
@@ -355,26 +357,48 @@ const info = await window.nova.ipc('nova:ready', {});
 // {
 //   success: true,
 //   appId: 'com.example.myapp',
-//   permissions: ['fs:read', 'device:notifications'],
+//   permissions: ['vfs:read', 'device:notifications'],
 //   optionalPermissions: ['net:external'],
 //   osVersion: '3.0.0',
 //   securityPatch: '2026-05-01'
 // }
 ```
 
-### Filesystem — `nova:fs:*`
+### Filesystem — `nova:vfs:*`
 
-All filesystem operations require the appropriate `fs:*` permission.
+All filesystem operations require the appropriate `vfs:*` permission. This is **NovaByte's own OS-managed virtual filesystem** — the same data the built-in Files app shows (worker/IndexedDB-backed), never real Node `fs` or real host disk. (Renamed from `fs:*` — that name read as raw Node filesystem access, which this has never been. Real host-disk access, if it ever gets built, is reserved for its own separate, picker-mediated permission later — a single user-chosen file via a native dialog, not free-roam path access — deliberately not this.)
+
+**Ownership scoping:** `vfs:read` can see the shared/general area of the tree plus your app's own `/data/<your-app-id>/` folder, but never another app's `/data/<other-app-id>/` folder. `vfs:write`/`vfs:delete` (and the rename/move/mkdir operations) are scoped tighter — they only ever work inside your own `/data/<your-app-id>/` folder, even in the shared area. Write outside your own app-data folder fails with `PERMISSION_DENIED`, not silently no-op'ing.
 
 ```javascript
-// Read a file (requires fs:read)
-const { content, size, modified } = await window.nova.ipc('nova:fs:read', { path: '/docs/notes.txt' });
+// Read a file (requires vfs:read)
+const { content, size, modified } = await window.nova.ipc('nova:vfs:read', { path: '/docs/notes.txt' });
 
-// Write a file (requires fs:write)
-await window.nova.ipc('nova:fs:write', { path: '/docs/notes.txt', content: 'Hello' });
+// List a folder's contents (requires vfs:read) — separate channel from read
+const { files } = await window.nova.ipc('nova:vfs:list', { path: '/docs' });
+// files: [{ id, name, type, mimeType, size, modified, created }, ...]
 
-// Delete a file (requires fs:delete)
-await window.nova.ipc('nova:fs:delete', { path: '/docs/notes.txt' });
+// Get metadata only, no file content (requires vfs:metadata — vfs:read also
+// works, since full read is a superset of metadata-only access)
+const { stat } = await window.nova.ipc('nova:vfs:stat', { path: '/docs/notes.txt' });
+// stat: { id, name, type, mimeType, size, path, parentId, created, modified, accessed, tags }
+
+// Write a file (requires vfs:write) — only works under your own /data/<app-id>/
+await window.nova.ipc('nova:vfs:write', { path: '/data/notes.txt', content: 'Hello' });
+
+// Create a folder (requires vfs:write) — 'path' is the *parent* folder,
+// same own-app-data scoping as write; omit path to create under your app root
+await window.nova.ipc('nova:vfs:mkdir', { path: '/data', name: 'exports' });
+
+// Rename a file/folder in place (requires vfs:write) — same own-app-data scoping
+await window.nova.ipc('nova:vfs:rename', { path: '/data/notes.txt', name: 'renamed.txt' });
+
+// Move a file/folder (requires vfs:write) — both source and destination must
+// resolve inside your own /data/<app-id>/ folder
+await window.nova.ipc('nova:vfs:move', { path: '/data/notes.txt', destPath: '/data/exports/notes.txt' });
+
+// Delete a file (requires vfs:delete) — same own-app-data scoping as write
+await window.nova.ipc('nova:vfs:delete', { path: '/data/notes.txt' });
 ```
 
 ### Notifications — `nova:notifications:*`
@@ -397,10 +421,10 @@ Rate limited to 10 notifications per app per minute. Once exceeded, further call
 ### Clipboard — `nova:clipboard:*`
 
 ```javascript
-// Read clipboard (requires fs:read)
+// Read clipboard (requires vfs:read)
 const { text } = await window.nova.ipc('nova:clipboard:read', {});
 
-// Write clipboard (requires fs:read)
+// Write clipboard (requires vfs:read)
 await window.nova.ipc('nova:clipboard:write', { text: 'Hello' });
 ```
 
@@ -617,14 +641,14 @@ const { keys } = await window.nova.ipc('nova:storage:keys', {});
 ### File picker — `nova:dialog:*`
 
 ```javascript
-// Open file picker (requires fs:read)
+// Open file picker (requires vfs:read)
 const file = await window.nova.ipc('nova:dialog:open', {
   accept: ['.txt', '.md'],
   multiple: false,
 });
 // { path, name, content }
 
-// Save file picker (requires fs:write)
+// Save file picker (requires vfs:write)
 await window.nova.ipc('nova:dialog:save', {
   filename: 'notes.txt',
   content: 'Hello',
@@ -660,8 +684,8 @@ Apps can declare a minimum OS security patch level required to run. The OS check
 
 | Permission | Risk |
 |------------|------|
-| `fs:write` | High |
-| `fs:delete` | Critical |
+| `vfs:write` | High |
+| `vfs:delete` | Critical |
 | `device:geolocation` | High |
 | `system:settings` | High |
 | `admin:system` | Critical |
