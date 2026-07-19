@@ -732,6 +732,18 @@ If the user's OS patch is older than required, an unskippable dialog appears wit
 - Don't use `eval()` — use safer alternatives
 - Validate and sanitize all user input and any file content you read
 - Don't collect data you don't need
+- **Default to wrapping your entry point in a DOM-ready check, especially as your app grows.** A simple single-file app can sometimes get away with relying on script-position-in-`<body>`, but as `.novaapp` projects grow past a trivial size — more elements, more scripts, more setup code — it's easy to end up with a DOM query running before its target element exists, producing `Uncaught TypeError: Cannot read properties of null (reading 'addEventListener')` or similar. Make this your default pattern from the start rather than debugging it later:
+  ```javascript
+  function main() {
+    document.getElementById('pad').addEventListener('click', /* ... */);
+    // rest of your DOM-touching setup
+  }
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', main);
+  } else {
+    main();
+  }
+  ```
 
 ### Content Scanner — avoiding false positives on install
 
