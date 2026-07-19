@@ -20,7 +20,7 @@
 
 <br>
 
-[**Getting Started**](#getting-started) · [**Manifest Format**](#manifest-format) · [**App Runtime**](#app-runtime) · [**Permissions**](#permissions) · [**Private Storage**](#private-storage) · [**IPC API**](#ipc-api-windownova) · [**Security**](#security) · [**Getting Verified**](#how-to-get-your-novaapp-verified) · [**Distribution**](#distribution)
+[**Getting Started**](#getting-started) · [**Manifest Format**](#manifest-format) · [**App Runtime**](#app-runtime) · [**Permissions**](#permissions) · [**Private Storage**](#private-storage) · [**IPC API**](#ipc-api-windownova) · [**Background Execution**](#background-execution-novabackground) · [**Security**](#security) · [**Getting Verified**](#how-to-get-your-novaapp-verified) · [**Distribution**](#distribution)
 
 </div>
 
@@ -248,9 +248,11 @@ Permissions are declared in `manifest.json` and checked before the app loads. Th
 
 ### Full permission list
 
-29 permissions across 8 categories. This mirrors `app-permission-manager.js` exactly — if you're hand-writing a manifest, these are the only strings `validateManifest` recognizes without a warning. (`data:export`/`data:backup`, previously listed here, don't exist as real permissions — they were dead metadata with no backing handler and have been removed from the OS entirely; the export feature in Settings isn't permission-gated.)
+32 permissions across 8 categories. This mirrors `app-permission-manager.js` exactly — if you're hand-writing a manifest, these are the only strings `validateManifest` recognizes without a warning. (`data:export`/`data:backup`, previously listed here, don't exist as real permissions — they were dead metadata with no backing handler and have been removed from the OS entirely; the export feature in Settings isn't permission-gated.)
 
 `vfs:metadata` is worth calling out specifically: it existed in the permission registry from the start, but the handler behind it (`nova:vfs:stat`) checked `vfs:read` instead — declaring `vfs:metadata` alone in a manifest silently did nothing. That's now fixed; `vfs:metadata` genuinely gates `nova:vfs:stat` on its own (an app with `vfs:read` still works too, since full read is a superset of metadata-only access).
+
+`system:background`, `system:background:live`, and `system:autostart` are three deliberately separate grants for background execution, not one permission in disguise — see [Background execution](#background-execution--novabackground) below for how they differ and how to use each.
 
 | Permission | Category | Risk | Useful for |
 |------------|----------|------|------------|
@@ -279,6 +281,9 @@ Permissions are declared in `manifest.json` and checked before the app loads. Th
 | `system:settings` | System | Medium | Preference sync, theme/settings dashboards |
 | `system:apps` | System | Medium | Launchers, app-store-style installers, dock/dashboard replacements |
 | `system:events` | System | Medium | Reacting to OS-level events (theme change, etc.) |
+| `system:background` | System | Medium | Periodic sync/checks while closed — reminders, cache refresh, polling (see below) |
+| `system:background:live` | System | High | Staying alive after the window closes — timers, active transfers, live connections (see below) |
+| `system:autostart` | System | High | Launching automatically at OS startup with no user action at all (see below) |
 | `admin:apps` | Admin | High | Fleet/security audit tools — see actual grants per app, not just declared ones (needs admin mode, see below) |
 | `admin:users` | Admin | Critical | Session monitors, force-logout tools (needs admin mode) |
 | `admin:system` | Admin | Critical | Security-policy dashboards, lockout/IP-block tuning (needs admin mode) |
@@ -647,6 +652,56 @@ window.nova.onEvent('theme:change', (data) => {
 ```
 
 Calling `nova.ipc('nova:events:unsubscribe', { event: 'theme:change' })` directly still works if you need to unsubscribe explicitly.
+
+### Background execution — `nova:background:*`
+
+Three separate permissions cover three genuinely different questions — none of them implies another, the same way `vfs:read` doesn't imply `vfs:write`:
+
+| Permission | Answers | Your app needs to have been opened by the user first? |
+|------------|---------|---------|
+| `system:background` | "Can this app periodically wake up and do a little work while closed?" | No — the OS can wake it even if it's never been launched this session |
+| `system:background:live` | "Can this app keep running after its window is closed?" | Yes — it has to already be open and choose to stay alive |
+| `system:autostart` | "Can this app launch itself at OS startup with no user action at all?" | No — this is the biggest ask of the three |
+
+#### Tier 1 — scheduled wake (`system:background`)
+
+The OS periodically (roughly every 15 minutes) spins your app up headlessly — no window, no visible UI — and gives it a short window (a few seconds) to do work: check state, sync data, refresh a cache. It does **not** grant `device:notifications` — a wake handler that wants to alert the user still needs that permission separately and will get `PERMISSION_DENIED` from `nova:notifications:show` without it, exactly as it would in the foreground.
+
+```javascript
+// Requires system:background
+window.nova.onBackgroundWake((info) => {
+  // info.wokeAt    — ISO timestamp
+  // info.deadlineMs — how long you have before the host tears this down regardless
+
+  // do your check/sync/refresh here — keep it brief
+  doQuickSync();
+
+  // Optional: signal you're done early so the host doesn't wait out the
+  // full deadline before cleaning up.
+  window.nova.backgroundWakeDone();
+});
+```
+
+If you never call `backgroundWakeDone()`, the host just waits out `deadlineMs` and tears the sandbox down anyway — calling it is a courtesy, not a requirement.
+
+#### Tier 2 — stay alive after close (`system:background:live`)
+
+Holding this permission is **not** enough by itself to keep your app running — that would mean every app with the grant gets backgrounded on every close whether it wants to or not. Your app has to explicitly opt in for the current session:
+
+```javascript
+// Requires system:background:live
+const { enabled } = await window.nova.stayAliveInBackground();
+// Call again with `false` if you change your mind before the window closes:
+// await window.nova.stayAliveInBackground(false);
+```
+
+Once opted in, closing the window keeps your app's process running instead of terminating it. The user sees a one-time "App started running in the background" toast, plus a persistent, non-dismissible entry pinned to the top of the notification panel with a **Terminate** button — that button is the only way the process stops short of the app exiting on its own. If the user reopens your app from the launcher while it's live in the background, the OS reattaches your existing running instance into the new window (same process, same in-memory state) rather than starting a second copy, and the pinned notification clears since the app is visibly open again. Closing it again re-backgrounds it without needing to call `stayAliveInBackground()` a second time, since your app never actually stopped.
+
+#### Tier 3 — autostart at OS boot (`system:autostart`)
+
+The biggest ask of the three: your app can launch itself when NovaByte OS starts, before the user has opened anything. This is opt-in on two separate axes — your app needs the grant, *and* the user has to have added your app to their own "start at boot" list (via the app's detail page in App Manager, which only shows that toggle for apps that declared `system:autostart`). Neither one alone is enough. There's no runtime API for this tier — nothing to call from your app's JS. It either launches at boot or it doesn't, based on those two checks.
+
+Autostart never runs behind a lock screen — if the machine is locked at boot, autostart apps wait until the user unlocks before launching.
 
 ### Storage — `nova:storage:*`
 
