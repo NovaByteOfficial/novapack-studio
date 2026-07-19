@@ -248,6 +248,8 @@ Permissions are declared in `manifest.json` and checked before the app loads. Th
 
 ### Full permission list
 
+29 permissions across 8 categories. This mirrors `app-permission-manager.js` exactly — if you're hand-writing a manifest, these are the only strings `validateManifest` recognizes without a warning. (`data:export`/`data:backup`, previously listed here, don't exist as real permissions — they were dead metadata with no backing handler and have been removed from the OS entirely; the export feature in Settings isn't permission-gated.)
+
 | Permission | Category | Risk |
 |------------|----------|------|
 | `fs:read` | Filesystem | Medium |
@@ -260,24 +262,27 @@ Permissions are declared in `manifest.json` and checked before the app loads. Th
 | `mail:read` | Email | High |
 | `mail:write` | Email | Critical |
 | `mail:send` | Email | Critical |
-| `mail:delete` | Email | High |
+| `mail:delete` | Email | Critical |
 | `calendar:read` | Calendar | Medium |
 | `calendar:write` | Calendar | High |
 | `calendar:delete` | Calendar | High |
 | `contacts:read` | Contacts | Medium |
 | `contacts:write` | Contacts | High |
-| `device:notifications` | Device | Medium |
+| `contacts:delete` | Contacts | High |
+| `device:notifications` | Device | Low |
 | `device:geolocation` | Device | High |
 | `device:camera` | Device | Critical |
 | `device:microphone` | Device | Critical |
 | `system:info` | System | Low |
-| `system:settings` | System | High |
-| `system:apps` | System | High |
-| `data:export` | Data | Medium |
-| `data:backup` | Data | High |
+| `system:settings` | System | Medium |
+| `system:apps` | System | Medium |
+| `system:events` | System | Medium |
+| `admin:apps` | Admin | High |
 | `admin:users` | Admin | Critical |
 | `admin:system` | Admin | Critical |
-| `admin:audit` | Admin | Critical |
+| `admin:audit` | Admin | High |
+
+`admin:*` additionally requires the machine itself to be in admin mode — a separate, local-only toggle in Settings → Privacy & Security → Admin Access. Granting an app one of the four `admin:*` permissions doesn't put the machine in admin mode by itself; both gates have to pass, or the call is denied with a message telling you the machine isn't in admin mode. `mail:*` requires an email account to already be connected via the Email app — there's no way for a sandboxed app to supply its own account credentials; `mail:*` always acts on whatever account the user has connected, and calls fail with a clear error if nothing's connected.
 
 ### Required vs optional
 
@@ -412,15 +417,9 @@ const state = await window.nova.ipc('nova:window:getState', {});
 // { width, height, x, y, maximized, minimized }
 ```
 
-### App launcher — `nova:app:*`
+### App launcher
 
-```javascript
-// Launch another app (requires system:apps)
-await window.nova.ipc('nova:app:launch', { appId: 'com.example.otherapp' });
-
-// Get info about an app (requires system:apps)
-const info = await window.nova.ipc('nova:app:info', { appId: 'com.example.otherapp' });
-```
+See [App management — `nova:app:*` / `window.nova.apps`](#app-management-novaapp-windownovaapps) below for the full reference (launch, info, list, install, uninstall).
 
 ### Network — `fetch()` / `nova:net:fetch`
 
@@ -438,7 +437,144 @@ const data = await res.json();
 
 ```javascript
 // Requires device:geolocation
-const { latitude, longitude, accuracy } = await window.nova.ipc('nova:device:geolocation', {});
+const { coords, timestamp } = await window.nova.ipc('nova:device:geolocation', {
+  options: { timeout: 5000 }, // passed through to getCurrentPosition
+});
+// coords: { latitude, longitude, altitude, accuracy, altitudeAccuracy, heading, speed }
+```
+
+### Camera / Microphone — `window.nova.getUserMedia`
+
+A live `MediaStream` can't cross the IPC bridge — `nova:device:camera`/`nova:device:microphone` are authorization-only checks. Use the `getUserMedia` convenience wrapper instead of calling them directly; it checks the app-level permission first, then calls the real `navigator.mediaDevices.getUserMedia()` in your own document (which still goes through the browser's own permission gate too):
+
+```javascript
+// Requires device:camera and/or device:microphone matching your constraints
+try {
+  const stream = await window.nova.getUserMedia({ video: true });
+  // use stream, then stop tracks when done:
+  stream.getTracks().forEach(t => t.stop());
+} catch (err) {
+  // PERMISSION_DENIED from the app-level check, or a standard
+  // getUserMedia DOMException (NotAllowedError, NotFoundError, NotReadableError)
+}
+```
+
+### Calendar — `nova:calendar:*` / `window.nova.calendar`
+
+Reads and writes the **same shared calendar data** the built-in Calendar app uses — not an isolated per-app store.
+
+```javascript
+// requires calendar:read
+const { events } = await window.nova.calendar.list();
+
+// requires calendar:write
+await window.nova.calendar.save({ id: 'my-event', title: 'Standup', date: '2026-07-20' });
+
+// requires calendar:delete
+await window.nova.calendar.remove('my-event');
+```
+
+### Contacts — `nova:contacts:*` / `window.nova.contacts`
+
+Same shared-data model as Calendar — reads/writes the real Contacts app's data.
+
+```javascript
+// requires contacts:read
+const { contacts } = await window.nova.contacts.list();
+
+// requires contacts:write
+await window.nova.contacts.save({ id: 'c1', name: 'Jane Doe', email: 'jane@example.com' });
+
+// requires contacts:delete
+await window.nova.contacts.remove('c1');
+```
+
+### App management — `nova:app:*` / `window.nova.apps`
+
+```javascript
+// List installed apps (requires system:apps)
+const { apps } = await window.nova.apps.list();
+
+// Launch another app (requires system:apps)
+await window.nova.apps.launch('com.example.otherapp');
+
+// Get info about an app (requires system:apps)
+const info = await window.nova.ipc('nova:app:info', { appId: 'com.example.otherapp' });
+
+// Install a package (requires system:apps) — fails closed. Only succeeds
+// for a package that's fully signed, trust-store-verified, and unmodified.
+// Anything that would normally need a human to click through a warning
+// dialog (untrusted signer, tampered contents, already installed) is
+// rejected outright rather than silently bypassed — install that manually
+// via App Manager instead.
+await window.nova.apps.install(packageObject);
+
+// Uninstall an app (requires system:apps) — only works on real,
+// file-installed .novaapp packages, not built-in system apps.
+await window.nova.apps.uninstall('com.example.otherapp');
+```
+
+### Admin — `nova:admin:*` / `window.nova.admin`
+
+Requires **both** the relevant `admin:*` permission grant on your app *and* the machine's local admin-mode flag to be on (Settings → Privacy & Security → Admin Access, off by default). If the machine isn't in admin mode, calls reject with a message saying so — that's a correct, working denial, not a bug to work around.
+
+```javascript
+// requires admin:audit — reads the live server event log (a 500-entry
+// ring buffer, not a persisted audit trail)
+const { logs } = await window.nova.admin.auditQuery({ limit: 10 });
+
+// requires admin:system — read or update server-side security settings
+// (password policy, lockout thresholds, IP blocking, etc.)
+const { settings } = await window.nova.admin.systemGet();
+await window.nova.admin.systemSet({ sessionTimeoutMinutes: 30 });
+
+// requires admin:users — list/revoke active sessions (this OS is
+// single-user; "sessions" here means active browser/app sessions, not
+// separate user accounts)
+const { sessions } = await window.nova.admin.usersList();
+await window.nova.admin.usersRevoke(sessionId);
+
+// requires admin:apps — admin-scoped view of the same app registry
+// system:apps already exposes; distinguishes "an app I granted
+// system:apps can manage apps for itself" from "an admin-mode app can
+// audit what's installed system-wide"
+const { apps } = await window.nova.admin.appsList();
+```
+
+### Mail — `nova:mail:*` / `window.nova.mail`
+
+Acts on whatever email account is currently connected in the host Email app — there's no separate mail identity for sandboxed apps, and no way to supply your own credentials through this API. If nothing's connected, every call rejects with a clear "no email account connected" message.
+
+```javascript
+// requires mail:read
+const { data } = await window.nova.mail.folders();
+const { data } = await window.nova.mail.messages({ folder: 'INBOX', page: 1, limit: 20 });
+const { data } = await window.nova.mail.message(uid, 'INBOX');
+const { data } = await window.nova.mail.search('invoice', 'INBOX');
+const { data } = await window.nova.mail.account(); // { restored, type, host, user }
+
+// requires mail:write — batch mark-read/move, plus HTML preview
+// rendering. Does NOT cover delete, even though it's the same server
+// endpoint as mail:delete's batch op.
+await window.nova.mail.markRead([101, 102], 'INBOX');
+await window.nova.mail.move([101], 'Archive', 'INBOX');
+const { token } = await window.nova.mail.preview('<p>Hello</p>');
+
+// requires mail:send — smtpHost/smtpPort are mandatory. The server has
+// no way to infer your account's real SMTP host from its IMAP/POP3/EWS
+// host (they're frequently different, e.g. Gmail's imap.gmail.com vs
+// smtp.gmail.com) — get this from the same account config your user
+// already set up in the Email app, don't guess at it.
+await window.nova.mail.send({
+  to: 'someone@example.com',
+  subject: 'Hello',
+  text: 'Hi there',
+  smtpHost: 'smtp.example.com',
+  smtpPort: 587,
+});
+
+// requires mail:delete
+await window.nova.mail.remove([101], 'INBOX');
 ```
 
 ### System info — `nova:system:info`
@@ -502,7 +638,9 @@ await window.nova.ipc('nova:dialog:save', {
 | `QUOTA_EXCEEDED` | Storage limit reached |
 | `NETWORK_ERROR` | Fetch failed |
 | `RATE_LIMITED` | Too many calls to a rate-limited API in the current window (e.g. notifications) |
-| `UNAVAILABLE` | The underlying OS service isn't available (e.g. headless/test environment) |
+| `UNAVAILABLE` | The underlying OS service isn't available, a required upstream connection isn't set up yet (e.g. no email account connected), or a machine-level gate is closed (e.g. `admin:*` when the machine isn't in admin mode) |
+| `UNVERIFIED` | `nova:app:install` rejected an unsigned or trust-store-unverified package — this is a correct, fail-closed rejection, not a bug |
+| `GEOLOCATION_ERROR` | The browser's geolocation API itself failed or timed out (separate from `PERMISSION_DENIED`, which means the app-level grant was missing) |
 
 ---
 
