@@ -428,6 +428,11 @@ const { text } = await window.nova.ipc('nova:clipboard:read', {});
 await window.nova.ipc('nova:clipboard:write', { text: 'Hello' });
 ```
 
+Reads/writes hit the real system clipboard via `navigator.clipboard`, not just an in-OS value:
+
+- **Read** tries `navigator.clipboard.readText()` first. If that throws (no permission, no focus, insecure context), it falls back to the last value this OS instance itself wrote, so same-session copy/paste inside Nova keeps working even when the browser clipboard API is unavailable.
+- **Write** tries `navigator.clipboard.writeText()` first, falling back to a legacy `execCommand('copy')` shim if that fails. If both fail, the call rejects with a `CLIPBOARD_UNAVAILABLE` error instead of silently no-oping.
+
 ### Window — `nova:window:*`
 
 ```javascript
@@ -456,6 +461,23 @@ const res = await fetch('https://api.example.com/data', {
 });
 const data = await res.json();
 ```
+
+### WebSocket — `nova:net:websocket` / `window.nova.websocket`
+
+Requires `net:websocket`. Don't call the raw `nova:net:websocket` / `nova:net:ws:send` / `nova:net:ws:close` IPC methods directly — use the `window.nova.websocket()` wrapper, which handles requestId bookkeeping and event dispatch for you:
+
+```javascript
+const ws = await window.nova.websocket('wss://example.com/socket');
+
+ws.onMessage((msg) => console.log('received:', msg));
+ws.onError((err) => console.error('ws error:', err));
+ws.onClose(() => console.log('closed'));
+
+ws.send('hello');
+ws.close(1000, 'done');
+```
+
+The returned promise resolves once the connection is open. **Note:** it only resolves from the host's `onopen` handler — there's no host-side rejection path if the connection never opens (bad host, refused connection, TLS failure before handshake). In those cases the call just sits until the IPC layer's own timeout fires and rejects with a generic "IPC request timed out" error rather than a specific connection-failure reason. Treat that timeout as a real connection failure, not a hung guest.
 
 ### Geolocation — `nova:device:geolocation`
 
