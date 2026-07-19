@@ -250,37 +250,37 @@ Permissions are declared in `manifest.json` and checked before the app loads. Th
 
 29 permissions across 8 categories. This mirrors `app-permission-manager.js` exactly — if you're hand-writing a manifest, these are the only strings `validateManifest` recognizes without a warning. (`data:export`/`data:backup`, previously listed here, don't exist as real permissions — they were dead metadata with no backing handler and have been removed from the OS entirely; the export feature in Settings isn't permission-gated.)
 
-| Permission | Category | Risk |
-|------------|----------|------|
-| `fs:read` | Filesystem | Medium |
-| `fs:write` | Filesystem | High |
-| `fs:delete` | Filesystem | Critical |
-| `fs:metadata` | Filesystem | Low |
-| `net:internal` | Network | Low |
-| `net:external` | Network | Medium |
-| `net:websocket` | Network | Medium |
-| `mail:read` | Email | High |
-| `mail:write` | Email | Critical |
-| `mail:send` | Email | Critical |
-| `mail:delete` | Email | Critical |
-| `calendar:read` | Calendar | Medium |
-| `calendar:write` | Calendar | High |
-| `calendar:delete` | Calendar | High |
-| `contacts:read` | Contacts | Medium |
-| `contacts:write` | Contacts | High |
-| `contacts:delete` | Contacts | High |
-| `device:notifications` | Device | Low |
-| `device:geolocation` | Device | High |
-| `device:camera` | Device | Critical |
-| `device:microphone` | Device | Critical |
-| `system:info` | System | Low |
-| `system:settings` | System | Medium |
-| `system:apps` | System | Medium |
-| `system:events` | System | Medium |
-| `admin:apps` | Admin | High |
-| `admin:users` | Admin | Critical |
-| `admin:system` | Admin | Critical |
-| `admin:audit` | Admin | High |
+| Permission | Category | Risk | Useful for |
+|------------|----------|------|------------|
+| `fs:read` | Filesystem | Medium | Reading files a user opens/imports |
+| `fs:write` | Filesystem | High | Saving files, exports, generated output |
+| `fs:delete` | Filesystem | Critical | File managers, cleanup tools |
+| `fs:metadata` | Filesystem | Low | Listing/sizing files without reading contents |
+| `net:internal` | Network | Low | Calling this OS's own API/server endpoints |
+| `net:external` | Network | Medium | Calling any third-party HTTP API (REST, webhooks, AI providers) |
+| `net:websocket` | Network | Medium | Live/streaming connections (chat, realtime data feeds) |
+| `mail:read` | Email | High | Inbox viewers, search, unread-count widgets |
+| `mail:write` | Email | Critical | Mark-as-read/move tools, compose-preview UIs |
+| `mail:send` | Email | Critical | Send-on-your-behalf tools (needs its own SMTP config UI — see below) |
+| `mail:delete` | Email | Critical | Cleanup/triage tools (spam pruning, bulk delete) |
+| `calendar:read` | Calendar | Medium | Agenda widgets, scheduling assistants |
+| `calendar:write` | Calendar | High | Event creation, meeting schedulers |
+| `calendar:delete` | Calendar | High | Calendar cleanup/sync tools |
+| `contacts:read` | Contacts | Medium | Address-book pickers, CRM-style lookups |
+| `contacts:write` | Contacts | High | Contact import/sync tools |
+| `contacts:delete` | Contacts | High | Dedup/cleanup tools |
+| `device:notifications` | Device | Low | Alerts, reminders, background-task completion pings |
+| `device:geolocation` | Device | High | Maps, weather, location-tagged content |
+| `device:camera` | Device | Critical | Photo capture, video chat, QR/barcode scanning |
+| `device:microphone` | Device | Critical | Voice recording, voice chat, dictation |
+| `system:info` | System | Low | Diagnostics, "about this device" panels |
+| `system:settings` | System | Medium | Preference sync, theme/settings dashboards |
+| `system:apps` | System | Medium | Launchers, app-store-style installers, dock/dashboard replacements |
+| `system:events` | System | Medium | Reacting to OS-level events (theme change, etc.) |
+| `admin:apps` | Admin | High | Fleet/security audit tools — see actual grants per app, not just declared ones (needs admin mode, see below) |
+| `admin:users` | Admin | Critical | Session monitors, force-logout tools (needs admin mode) |
+| `admin:system` | Admin | Critical | Security-policy dashboards, lockout/IP-block tuning (needs admin mode) |
+| `admin:audit` | Admin | High | Security/activity log viewers (needs admin mode) |
 
 `admin:*` additionally requires the machine itself to be in admin mode — a separate, local-only toggle in Settings → Privacy & Security → Admin Access. Granting an app one of the four `admin:*` permissions doesn't put the machine in admin mode by itself; both gates have to pass, or the call is denied with a message telling you the machine isn't in admin mode. `mail:*` requires an email account to already be connected via the Email app — there's no way for a sandboxed app to supply its own account credentials; `mail:*` always acts on whatever account the user has connected, and calls fail with a clear error if nothing's connected.
 
