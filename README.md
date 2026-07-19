@@ -577,6 +577,11 @@ await window.nova.mail.send({
 await window.nova.mail.remove([101], 'INBOX');
 ```
 
+**Getting an SMTP host to actually pass in:** the platform intentionally won't supply `smtpHost`/`smtpPort` for you (see above), so a real app has two paths, and each implies different UI work:
+
+- **Use `mail:*` against the already-connected Email app account** — your app needs its own small config surface to ask the user for their SMTP host/port (mirroring the same fields the built-in Email app already collects), since there's no way to read that back out of the connected session. This is the right choice when you want to act on the *same* account/mailbox the user already set up, not a separate one.
+- **Build an independent mail integration over `net:external`** — for any provider with an HTTP/REST API (Gmail API, Microsoft Graph, etc.), skip `mail:*` entirely and call the provider's API directly via `nova:net:fetch`, handling your own OAuth/auth flow. This gets you a fully separate account/session from whatever's connected in the Email app, and sidesteps the SMTP-host problem entirely since REST APIs don't need one. Note this only works for providers with an HTTP API — raw IMAP/SMTP/POP3 (the wire protocols) aren't reachable through `net:external` at all; there's no host-side handler for arbitrary non-HTTP protocols.
+
 ### System info — `nova:system:info`
 
 ```javascript
