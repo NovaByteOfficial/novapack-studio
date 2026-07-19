@@ -733,6 +733,20 @@ If the user's OS patch is older than required, an unskippable dialog appears wit
 - Validate and sanitize all user input and any file content you read
 - Don't collect data you don't need
 
+### Content Scanner — avoiding false positives on install
+
+Every dropped file and every file inside a `.novaapp` package is run through a static heuristic scanner (`window.Scanner`) before it's trusted — on drag-and-drop into Files/Desktop, and on App Manager package install. It isn't an AV engine; it's a small set of cheap tripwire checks. A handful of ordinary build patterns will trip it if you're not aware of the rules:
+
+- **Reference your script, don't inline it.** In `index.html`, use `<script src="app.js"></script>` — a local relative path to a sibling file in your package. An inline `<script>...</script>` block with actual code inside it is flagged and blocks install, no exceptions. This isn't about how the runtime loads your app (each file in a `.novaapp` package stays a separate file — nothing gets bundled into one HTML at build or runtime); it's purely about what the scanner allows: a `src` reference to local code is fine, code sitting directly inside the HTML is not.
+- **"Local" means local.** The `src` path can't have a scheme (`http://`, `data:`, etc.), can't be protocol-relative (`//...`), can't be absolute (`/...`), and can't contain `..` traversal. Keep it a plain relative filename like `app.js` or `js/app.js`.
+- **Don't `eval()` decoded/assembled strings.** `atob(...)`, `Buffer.from(..., 'base64')`, and `String.fromCharCode(...)` are all fine on their own (normal for crypto, binary data, images). What blocks is piping the result of one of those *into* `eval(...)`, `new Function(...)`, `document.write(...)`, or `.innerHTML =`. If you need to decode binary data, decode it and use it as data — don't hand it to something that executes it.
+- **Avoid literal `eval(` and `new Function(` entirely** if you can — both are flagged outright as obfuscation smells, independent of the base64 rule above.
+- **If your app renders user-supplied HTML/Markdown/SVG**, keep iframes sandboxed. An `<iframe>` with no `sandbox` attribute at all is always rejected; a sandboxed iframe combining `allow-same-origin` with `allow-scripts` is rejected too (that combination lets framed content script its way back out of the sandbox) — everything else with a proper `sandbox` attribute and a local or `https://` `src` is fine.
+- **Don't ship high-entropy content under a text-like extension.** If a file is declared `.js`, `.json`, `.svg`, `.html`, `.md`, `.txt`, etc. but its actual bytes look like packed/encoded binary (high Shannon entropy), it's flagged as likely disguised content — even with no other red flag matching.
+- **Don't double up extensions.** Something like `readme.pdf.exe` is flagged purely for having an executable extension trailing behind a plausible document one, regardless of actual file content.
+
+None of this affects `vendor/` libraries dropped in as single minified files (JS/CSS) — those get bundled at Build time via the normal template pipeline, not evaluated as a hostile drop.
+
 ---
 
 ## Package format
