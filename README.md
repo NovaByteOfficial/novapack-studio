@@ -384,6 +384,8 @@ All filesystem operations require the appropriate `vfs:*` permission. This is **
 
 **Ownership scoping:** `vfs:read` can see the shared/general area of the tree plus your app's own `/data/<your-app-id>/` folder, but never another app's `/data/<other-app-id>/` folder. `vfs:write`/`vfs:delete` (and the rename/move/mkdir operations) are scoped tighter — they only ever work inside your own `/data/<your-app-id>/` folder, even in the shared area. Write outside your own app-data folder fails with `PERMISSION_DENIED`, not silently no-op'ing.
 
+`<your-app-id>` above is filled in automatically by the host from whatever you pass — **you should never write your own literal app id into a path**. See [`/data/` path rewriting](#data-path-rewriting--read-this-before-you-build-anything) just below for the exact rules; getting this wrong is the single most common reason a fresh app's file tree looks empty, wrong, or throws `NOT_FOUND`.
+
 ```javascript
 // Read a file (requires vfs:read)
 const { content, size, modified } = await window.nova.ipc('nova:vfs:read', { path: '/docs/notes.txt' });
@@ -401,8 +403,10 @@ const { stat } = await window.nova.ipc('nova:vfs:stat', { path: '/docs/notes.txt
 await window.nova.ipc('nova:vfs:write', { path: '/data/notes.txt', content: 'Hello' });
 
 // Create a folder (requires vfs:write) — 'path' is the *parent* folder,
-// same own-app-data scoping as write; omit path to create under your app root
-await window.nova.ipc('nova:vfs:mkdir', { path: '/data', name: 'exports' });
+// same own-app-data scoping as write; omit path to create under your app root.
+// NOTE: 'path' must include the trailing slash ('/data/', not '/data') — see
+// the path-rewriting section right below for why this distinction matters.
+await window.nova.ipc('nova:vfs:mkdir', { path: '/data/', name: 'exports' });
 
 // Rename a file/folder in place (requires vfs:write) — same own-app-data scoping
 await window.nova.ipc('nova:vfs:rename', { path: '/data/notes.txt', name: 'renamed.txt' });
@@ -414,6 +418,27 @@ await window.nova.ipc('nova:vfs:move', { path: '/data/notes.txt', destPath: '/da
 // Delete a file (requires vfs:delete) — same own-app-data scoping as write
 await window.nova.ipc('nova:vfs:delete', { path: '/data/notes.txt' });
 ```
+
+#### `/data/` path rewriting — read this before you build anything
+
+**The most common first-app bug is a caller mistake, not a platform issue** — passing the wrong `/data/`-related path shape. The error messages you'll hit (`NOT_FOUND`, `PERMISSION_DENIED`) are the system correctly enforcing scoping; they just don't make *which path shape you got wrong* obvious. Every `/data/`-prefixed path you send is rewritten host-side before it's resolved:
+
+> Any path starting with `/data/` (**the trailing slash matters**) has the segment immediately after `/data/` replaced with your own app id, unconditionally — regardless of what you put there.
+
+That means:
+
+| You send | Host resolves it as | Result |
+|---|---|---|
+| `/data/notes.txt` | `/data/<your-app-id>/notes.txt` | ✅ correct — this is the intended usage |
+| `/data/<your-app-id>/notes.txt` | `/data/<your-app-id>/<your-app-id>/notes.txt` | ❌ double-nested. `NOT_FOUND` / "Parent folder not found" — **never include your own app id in the path**, the host adds it for you |
+| `/data` *(no trailing slash)* | `/data` unchanged — rewrite doesn't fire | ⚠️ resolves to the literal **shared** root. A `list` here returns *every app's* `/data/<app-id>/` folder, not just yours. Not a permission leak (write/delete still get blocked below your own subtree), but almost certainly not what you meant if you intended "my app's root" |
+| `/data/` *(trailing slash, nothing else)* | `/data/<your-app-id>/` | ✅ correct — this is the right way to refer to your own app root as a whole, e.g. for `list` or as `mkdir`'s parent |
+
+**Practical takeaways:**
+- Treat `/data/` (with the trailing slash) as your app's root constant. Don't hardcode your own app id into any path — the host does that for you, and doing it yourself double-nests.
+- If `list`/`write`/`mkdir` on what you thought was "my own root" is returning folders that aren't yours, you almost certainly sent bare `/data` without a trailing slash.
+- If you get `NOT_FOUND: Parent folder not found` on a path you were sure existed, check whether you accidentally concatenated your own app id into a `/data/`-prefixed path — that's the #1 cause.
+- A leading double-slash from concatenation (e.g. `'/data/' + '/foo.txt'` → `/data//foo.txt`) is harmless — empty path segments are skipped during resolution — but avoid it for readability.
 
 ### Notifications — `nova:notifications:*`
 
