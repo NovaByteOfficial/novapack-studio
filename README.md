@@ -786,7 +786,25 @@ Apps can declare a minimum OS security patch level required to run. The OS check
 
 If the user's OS patch is older than required, an unskippable dialog appears with a 6-second countdown and closes the window automatically. The user is directed to Settings → Updates. The dialog cannot be dismissed or bypassed.
 
-> **Not implemented in NBOSP:** an in-app trigger to re-check security compliance on demand (`nova:security:check`) was stubbed at one point and later removed. The launch-time `minSecurityPatch` enforcement described above is real and still runs automatically — there's just no runtime API to trigger it manually mid-session. If you need to gate a specific in-app action (like unlocking a vault) on OS patch level, do it via `nova:system:info` and compare `securityPatch` yourself; there's no dedicated helper for it right now.
+> **NovaByte OS v3 only:** an in-app trigger to re-check security compliance on demand is available via `window.parent.postMessage`. This is not available in NBOSP forks. If you need to gate a specific in-app action (like unlocking a vault) on OS patch level from inside your app, you can send a security check request and listen for the result:
+
+```javascript
+window.parent.postMessage({
+  type: 'nova:security:check',
+  minPatchDate: '2026-05-01',
+  reason: 'Required to store encrypted passwords safely.'
+}, '*');
+
+window.addEventListener('message', (e) => {
+  if (e.data.type === 'nova:security:result') {
+    console.log(e.data.compliant); // true or false
+    console.log(e.data.current);   // '2026-05-01'
+    console.log(e.data.required);  // '2026-05-01'
+    // If compliant is false, the OS already showed the blocking dialog
+    // and closed the window — you don't need to handle it yourself
+  }
+});
+```
 
 ### Best practices
 
