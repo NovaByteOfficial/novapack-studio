@@ -440,6 +440,22 @@ That means:
 - If you get `NOT_FOUND: Parent folder not found` on a path you were sure existed, check whether you accidentally concatenated your own app id into a `/data/`-prefixed path — that's the #1 cause.
 - A leading double-slash from concatenation (e.g. `'/data/' + '/foo.txt'` → `/data//foo.txt`) is harmless — empty path segments are skipped during resolution — but avoid it for readability.
 
+#### Auto-created subfolders in your app root
+
+The first time your app's `/data/<your-app-id>/` folder is set up, the host pre-populates it with four subfolders, before your code ever runs:
+
+```
+/data/<your-app-id>/
+  files/          — general-purpose app files (suggested default for user content)
+  cache/          — disposable/regenerable data
+  databases/      — structured/serialized data (JSON, etc.)
+  shared_prefs/   — simple key-value settings
+```
+
+This mirrors Android's internal-storage convention by name, but **nothing in the VFS enforces any behavioral difference between them** — they're plain folders with suggestive names, not special-cased storage tiers. Writing directly to your app root (e.g. `/data/notes.txt`) works exactly the same as writing into one of these subfolders; using them is a naming convention for your own organization, not a requirement.
+
+**Why this matters for you:** if your app lists its own root right after install and expects an empty folder, you'll see these four folders already sitting there. That's expected — it isn't stray data left by a previous run, and you don't need to (and can't meaningfully) delete and recreate them. If you're building a file browser or similar UI, decide up front whether to show these to the user as-is or filter them out of the view — most simple content apps (a notes app, a text editor) will want to hide or ignore them rather than surface OS-internal scaffolding as if it were user-created content.
+
 ### Notifications — `nova:notifications:*`
 
 ```javascript
