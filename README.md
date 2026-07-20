@@ -952,7 +952,7 @@ Any `.novaapp` package built with this SDK installs and runs on:
 - NovaByte OS v3.x.x
 - NBOSP (any version, any fork)
 
-The package format hasn't changed between v2.3.8 and v3. As long as a fork ships `app-package.js` and the App Manager, your package will work. The only thing that can break compatibility is declaring a `minSecurityPatch` date that the target OS hasn't reached — which is intentional.
+The package format hasn't changed between v2.3.8 and v3. As long as a fork ships `app-package.js` and the App Manager, your package will work. The only thing that can break compatibility is declaring a `minSecurityPatch` date that the target OS hasn't reached — which is intentional. 
 
 ---
 
