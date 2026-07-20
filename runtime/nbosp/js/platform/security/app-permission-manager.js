@@ -30,8 +30,8 @@ const AppPermissionManager = (() => {
   // ── Permission catalogue ───────────────────────────────────────────────────
 
   const PERMISSION_TYPES = Object.freeze({
-    FS_READ           : 'fs:read',        FS_WRITE          : 'fs:write',
-    FS_DELETE         : 'fs:delete',      FS_METADATA       : 'fs:metadata',
+    FS_READ           : 'vfs:read',       FS_WRITE          : 'vfs:write',
+    FS_DELETE         : 'vfs:delete',     FS_METADATA       : 'vfs:metadata',
     NET_INTERNAL      : 'net:internal',   NET_EXTERNAL      : 'net:external',
     NET_WEBSOCKET     : 'net:websocket',
     MAIL_READ         : 'mail:read',      MAIL_WRITE        : 'mail:write',
@@ -39,21 +39,45 @@ const AppPermissionManager = (() => {
     CALENDAR_READ     : 'calendar:read',  CALENDAR_WRITE    : 'calendar:write',
     CALENDAR_DELETE   : 'calendar:delete',
     CONTACTS_READ     : 'contacts:read',  CONTACTS_WRITE    : 'contacts:write',
+    CONTACTS_DELETE   : 'contacts:delete',
     DEVICE_NOTIFICATIONS: 'device:notifications',
     DEVICE_GEOLOCATION: 'device:geolocation',
     DEVICE_CAMERA     : 'device:camera',
     DEVICE_MICROPHONE : 'device:microphone',
     SYSTEM_INFO       : 'system:info',    SYSTEM_SETTINGS   : 'system:settings',
     SYSTEM_APPS       : 'system:apps',    SYSTEM_EVENTS     : 'system:events',
+    // Background execution is split into two independent grants on purpose:
+    // SYSTEM_BACKGROUND covers scheduled wake-ups (the app doesn't need to be
+    // open at all for the host to run it briefly), while
+    // SYSTEM_BACKGROUND_LIVE covers staying alive as a running process after
+    // the user closes its window — a strictly bigger ask, since the process
+    // keeps consuming resources indefinitely rather than waking briefly.
+    // Neither implies device:notifications — an app with either background
+    // grant still can't call nova:notifications:show without that grant too.
+    // SYSTEM_AUTOSTART is a third, separate thing again: launching the app
+    // at OS boot/login with no user action at all in that session, which is
+    // a bigger trust ask than either background tier and must be granted
+    // explicitly rather than folded into SYSTEM_BACKGROUND.
+    SYSTEM_BACKGROUND      : 'system:background',
+    SYSTEM_BACKGROUND_LIVE : 'system:background:live',
+    SYSTEM_AUTOSTART       : 'system:autostart',
     ADMIN_APPS        : 'admin:apps',     ADMIN_USERS       : 'admin:users',
     ADMIN_SYSTEM      : 'admin:system',   ADMIN_AUDIT       : 'admin:audit',
   });
 
   const PERMISSION_CATEGORIES = Object.freeze({
-    'fs:read'           : { category: 'filesystem', risk: 'medium',   label: 'Read files' },
-    'fs:write'          : { category: 'filesystem', risk: 'high',     label: 'Write files' },
-    'fs:delete'         : { category: 'filesystem', risk: 'critical', label: 'Delete files' },
-    'fs:metadata'       : { category: 'filesystem', risk: 'low',      label: 'File metadata' },
+    // Renamed from fs:* — this is NovaByte's own OS-managed virtual
+    // filesystem (the Files app / vault, worker+IndexedDB-backed), never
+    // real Node fs/real host disk. "fs:*" read as raw Node fs access to
+    // anyone coming in fresh, which it never was; "vfs:*" says what it
+    // actually is. Real host-disk access, if built, is reserved for a
+    // future picker-mediated fs:* (single user-chosen file via native
+    // dialog, not free-roam path access) — a categorically different,
+    // much higher-risk capability that deliberately isn't this.
+    'vfs:read'          : { category: 'filesystem', risk: 'medium',   label: 'Read files' },
+    'vfs:write'         : { category: 'filesystem', risk: 'high',     label: 'Write files' },
+    'vfs:delete'        : { category: 'filesystem', risk: 'critical', label: 'Delete files' },
+    'vfs:metadata'      : { category: 'filesystem', risk: 'low',      label: 'File metadata' },
     'net:internal'      : { category: 'network',    risk: 'low',      label: 'Internal network' },
     'net:external'      : { category: 'network',    risk: 'medium',   label: 'External network' },
     'net:websocket'     : { category: 'network',    risk: 'medium',   label: 'WebSocket connections' },
@@ -66,6 +90,7 @@ const AppPermissionManager = (() => {
     'calendar:delete'   : { category: 'calendar',   risk: 'high',     label: 'Delete calendar events' },
     'contacts:read'     : { category: 'contacts',   risk: 'medium',   label: 'Read contacts' },
     'contacts:write'    : { category: 'contacts',   risk: 'high',     label: 'Edit contacts' },
+    'contacts:delete'   : { category: 'contacts',   risk: 'high',     label: 'Delete contacts' },
     'device:notifications': { category: 'device',   risk: 'low',      label: 'Send notifications' },
     'device:geolocation': { category: 'device',     risk: 'high',     label: 'Access location' },
     'device:camera'     : { category: 'device',     risk: 'critical', label: 'Access camera' },
@@ -74,8 +99,9 @@ const AppPermissionManager = (() => {
     'system:settings'   : { category: 'system',     risk: 'medium',   label: 'System settings' },
     'system:apps'       : { category: 'system',     risk: 'medium',   label: 'Manage apps' },
     'system:events'     : { category: 'system',     risk: 'medium',   label: 'System events' },
-    'data:export'       : { category: 'data',       risk: 'high',     label: 'Export data' },
-    'data:backup'       : { category: 'data',       risk: 'high',     label: 'Backup data' },
+    'system:background' : { category: 'system',     risk: 'medium',   label: 'Run scheduled background tasks' },
+    'system:background:live': { category: 'system', risk: 'high',     label: 'Keep running after you close it' },
+    'system:autostart'  : { category: 'system',     risk: 'high',     label: 'Start automatically when NovaByte starts' },
     'admin:apps'        : { category: 'admin',      risk: 'high',     label: 'Manage apps (admin)' },
     'admin:users'       : { category: 'admin',      risk: 'critical', label: 'Manage users' },
     'admin:system'      : { category: 'admin',      risk: 'critical', label: 'System administration' },
@@ -282,21 +308,26 @@ const AppPermissionManager = (() => {
   async function requestAll(permissions, appId, appName) {
     if (!permissions?.length) return true;
 
-    const pending = permissions.filter(p => !isGranted(p, appId) && !isDenied(p, appId));
+    // Only skip permissions that are already granted — denied ones need to be
+    // surfaced so the caller knows to block the app, and requestPermission()
+    // will return false for them immediately without re-prompting.
+    const pending = permissions.filter(p => !isGranted(p, appId));
     if (!pending.length) return true;
 
     const resolvedName = appName
       ?? (typeof AppRegistry !== 'undefined' ? AppRegistry.getApp(appId)?.name : null)
       ?? appId;
 
+    let allGranted = true;
     for (let i = 0; i < pending.length; i++) {
-      await requestPermission(pending[i], appId, {
+      const granted = await requestPermission(pending[i], appId, {
         appName : resolvedName,
         current : i + 1,
         total   : pending.length,
       });
+      if (!granted) allGranted = false;
     }
-    return true;
+    return allGranted;
   }
 
   // ── Grant / revoke ─────────────────────────────────────────────────────────
@@ -320,6 +351,9 @@ const AppPermissionManager = (() => {
     saveToStorage();
     consentLog.push({ ...grant, timestamp: new Date().toISOString() });
     console.log(`[AppPermissionManager] Granted ${permission} → ${appId}`);
+    if (typeof EventLog !== 'undefined') {
+      EventLog.log({ app: 'Permissions', category: 'permissions', severity: 'info', message: `Granted ${permission} → ${appId}`, data: { appId, permission, action: 'grant' } });
+    }
   }
 
   function _persistDenial(permission, appId) {
@@ -338,6 +372,9 @@ const AppPermissionManager = (() => {
     permissionGrants.set(key, grant);
     saveToStorage();
     console.log(`[AppPermissionManager] Denied ${permission} → ${appId}`);
+    if (typeof EventLog !== 'undefined') {
+      EventLog.log({ app: 'Permissions', category: 'permissions', severity: 'warn', message: `Denied ${permission} → ${appId}`, data: { appId, permission, action: 'deny' } });
+    }
   }
 
   async function grantPermission(permission, appId, options = {}) {
@@ -348,14 +385,21 @@ const AppPermissionManager = (() => {
     permissionGrants.delete(`${appId}:${permission}`);
     saveToStorage();
     console.log(`[AppPermissionManager] Revoked ${permission} ← ${appId}`);
+    if (typeof EventLog !== 'undefined') {
+      EventLog.log({ app: 'Permissions', category: 'permissions', severity: 'info', message: `Revoked ${permission} ← ${appId}`, data: { appId, permission, action: 'revoke' } });
+    }
   }
 
   function revokeAllPermissions(appId) {
+    let count = 0;
     for (const key of [...permissionGrants.keys()]) {
-      if (key.startsWith(`${appId}:`)) permissionGrants.delete(key);
+      if (key.startsWith(`${appId}:`)) { permissionGrants.delete(key); count++; }
     }
     saveToStorage();
     console.log(`[AppPermissionManager] Revoked all permissions for ${appId}`);
+    if (typeof EventLog !== 'undefined') {
+      EventLog.log({ app: 'Permissions', category: 'permissions', severity: 'info', message: `Revoked all ${count} permission(s) for ${appId}`, data: { appId, count, action: 'revoke-all' } });
+    }
   }
 
   // ── Queries ────────────────────────────────────────────────────────────────

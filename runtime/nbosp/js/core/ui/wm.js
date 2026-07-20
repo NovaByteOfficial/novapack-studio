@@ -75,6 +75,62 @@ const WM = window.WM = (() => {
         });
         new ResizeObserver(_clearWACache).observe(tb);
       }
+
+      // Accept app-icon drags from desktop / launchpad onto the taskbar.
+      const taskbarApps = document.getElementById('taskbar-apps');
+      const taskbar = document.getElementById('taskbar');
+      if (taskbarApps && taskbar) {
+        taskbarApps.addEventListener('dragenter', (e) => {
+          const json = e.dataTransfer?.types?.includes('application/json');
+          if (json) {
+            e.preventDefault();
+            taskbar.classList.add('drag-over');
+          }
+        });
+        taskbarApps.addEventListener('dragover', (e) => {
+          const json = e.dataTransfer?.types?.includes('application/json');
+          if (json) {
+            e.preventDefault();
+            e.dataTransfer.dropEffect = 'link';
+            taskbar.classList.add('drag-over');
+          }
+        });
+        taskbarApps.addEventListener('dragleave', (e) => {
+          if (!taskbarApps.contains(e.relatedTarget)) {
+            taskbar.classList.remove('drag-over');
+          }
+        });
+        taskbarApps.addEventListener('drop', (e) => {
+          taskbar.classList.remove('drag-over');
+          const raw = e.dataTransfer?.getData('application/json');
+          if (!raw) return;
+          try {
+            const payload = JSON.parse(raw);
+            if (payload?.type === 'app-shortcut' && payload?.appId) {
+              e.preventDefault();
+              const pins = OS.settings.get('pinnedApps') || [];
+              if (pins.includes(payload.appId)) {
+                Notify.show({
+                  title:   'Already Pinned',
+                  body:    `${payload.appName || payload.appId} is already pinned to taskbar`,
+                  type:    'info',
+                  appName: 'Taskbar',
+                });
+                return;
+              }
+              pins.push(payload.appId);
+              OS.settings.set('pinnedApps', pins);
+              wm.updateTaskbar();
+              Notify.show({
+                title:   'Pinned to Taskbar',
+                body:    `${payload.appName || payload.appId} pinned to taskbar`,
+                type:    'success',
+                appName: 'Taskbar',
+              });
+            }
+          } catch { /* ignore invalid payload */ }
+        });
+      }
     },
 
     createWindow(appId, options) {
@@ -91,6 +147,8 @@ const WM = window.WM = (() => {
       const id  = generateId();
       const app = OS.apps[appId];
       if (!app) return null;
+
+      if (!OS.settings.get('devMode') && app.devOnly) return null;
 
       const defaults = {
         width:     app.defaultSize?.[0] ?? 700,
@@ -222,6 +280,21 @@ const WM = window.WM = (() => {
         const { files } = e.dataTransfer;
         for (let i = 0; i < files.length; i++) {
           const file = files[i];
+
+          if (window.Scanner) {
+            let verdict;
+            try {
+              verdict = await window.Scanner.scan(file);
+            } catch (err) {
+              console.warn('[WM] Scanner error:', err);
+              verdict = { safe: false, reason: `Could not verify "${file.name}" — dropped in a safe state and skipped.` };
+            }
+            if (!verdict.safe) {
+              Notify.show({ title: 'File Blocked', body: verdict.reason, type: 'error', appName: 'Security' });
+              continue;
+            }
+          }
+
           if (app.onDrop) {
             try {
               await app.onDrop(file, state);
@@ -287,29 +360,105 @@ const WM = window.WM = (() => {
       wm.updateTaskbar();
       wm.applyWindowFlags(state);
 
-      try {
-        if (app.init) app.init(content, state, options);
-      } catch (err) {
-        console.warn(`[WM] ${appId}.init error:`, err);
+      // If this app already has a live sandbox sitting in the background
+      // host (system:background:live kept it alive after a previous
+      // window close), reattach that instance instead of launching a
+      // second, independent one — otherwise the app silently ends up
+      // running twice, with the original orphaned and its pinned
+      // notification now describing a process the user can't see or find
+      // from this new window.
+      let reattached = false;
+      if (typeof AppSandbox !== 'undefined') {
+        const bg = AppSandbox.getAllSandboxes().find(s => s.appId === appId && s.backgrounded);
+        if (bg) {
+          reattached = AppSandbox.reattachFromBackground(bg.sandboxId, content, state);
+          if (reattached && typeof Notify !== 'undefined' && Notify.unpin) {
+            Notify.unpin(`pin_bg_${appId}`);
+          }
+        }
       }
 
+      try {
+        if (!reattached && app.init) app.init(content, state, options);
+      } catch (err) {
+        console.warn(`[WM] ${appId}.init error:`, err);
+        if (typeof EventLog !== 'undefined') {
+          EventLog.log({ app: 'WM', category: 'window', severity: 'error', message: `${appId}.init threw: ${err?.message || err}`, data: { windowId: id, appId } });
+        }
+      }
+
+      // `app` here is the exact object reference registerApp() pushed into
+      // APP_REGISTRY (OS.apps[appId] and the APP_REGISTRY entry are the same
+      // object, not a copy) — so mutating it directly is enough, no separate
+      // lookup-by-id needed. Previously nothing on this path ever touched
+      // launchCount, so every app showed 0 in Inspector regardless of how
+      // many times it had actually been opened. Not to be confused with the
+      // unrelated launchCount tracked by platform/core/app-registry.js,
+      // which is a separate sandboxed-app registry with its own storage.
+      app.launchCount = (app.launchCount || 0) + 1;
+      app.lastLaunched = Date.now();
+
       OS.events.emit('app:opened', { id, appId });
+      if (typeof EventLog !== 'undefined') {
+        EventLog.log({ app: 'WM', category: 'window', severity: 'info', message: `Opened window for ${appId}`, data: { windowId: id, appId } });
+      }
       return state;
     },
 
-    closeWindow(id) {
+    closeWindow(id, options = {}) {
+      const { forceKill = false } = options;
       const state = OS.windows.get(id);
-      if (!state) return;
+      if (!state) return Promise.resolve();
 
       state.element.classList.add('closing');
 
       // Use animationend for accurate timing; fall back after 250 ms in case
       // no animation fires (reduced-motion, missing keyframe, etc.).
       let closed = false;
+      let resolveClosed;
+      const closedPromise = new Promise(res => { resolveClosed = res; });
       const finishClose = () => {
         if (closed) return;
         closed = true;
         clearTimeout(fallback);
+
+        // system:background:live keep-alive check. This only ever keeps the
+        // *sandbox* (the webview + its process) alive — the window chrome,
+        // event listeners, and OS.windows entry for this window are always
+        // torn down below exactly as before. What changes is whether
+        // AppSandbox destroys the webview or reparents it into the hidden
+        // background host first. An app must hold the grant AND have
+        // explicitly opted in this session via nova.stayAliveInBackground()
+        // (sandbox.wantsBackgroundLive, see handleBackgroundStayAlive in
+        // app-sandbox.js) for this to trigger — holding the grant alone is
+        // no longer sufficient. It used to be: every app with the
+        // permission got backgrounded on every close, whether or not it
+        // (or the user) had actually asked for that this session.
+        //
+        // forceKill skips this entirely: uninstall, "disable app", and any
+        // other path that's actually removing the app (see
+        // AppRegistry.unregisterApp) must not let a background grant turn
+        // into an orphaned webview that outlives the registry entry, its
+        // files, and its permissions. Those callers pass forceKill: true and
+        // additionally terminate any sandbox already sitting in the
+        // background host for this app (see below), since the app may have
+        // been backgrounded in an earlier session already.
+        let keptAlive = false;
+        let isFirstBackground = false;
+        try {
+          if (!forceKill &&
+              typeof AppPermissionManager !== 'undefined' &&
+              typeof AppSandbox !== 'undefined' &&
+              AppPermissionManager.isGranted('system:background:live', state.appId)) {
+            const sandbox = AppSandbox.getAllSandboxes().find(s => s.windowId === id && !s.backgrounded);
+            if (sandbox && sandbox.wantsBackgroundLive) {
+              isFirstBackground = !sandbox.everBackgrounded;
+              keptAlive = AppSandbox.detachToBackground(sandbox.sandboxId);
+            }
+          }
+        } catch (err) {
+          console.warn('[WM] background keep-alive check failed:', err);
+        }
 
         for (const cleanup of state.cleanups) {
           try { cleanup(); } catch (err) { console.warn('[WM] cleanup error:', err); }
@@ -320,6 +469,20 @@ const WM = window.WM = (() => {
         const app = OS.apps[state.appId];
         if (app?.onClose) {
           try { app.onClose(state); } catch (err) { console.warn(`[WM] ${state.appId}.onClose error:`, err); }
+        }
+
+        if (keptAlive && typeof Notify !== 'undefined' && Notify.pinBackgroundApp) {
+          const appName = app?.name || state.appId;
+          if (isFirstBackground) {
+            Notify.show({ title: `${appName} started running in the background`, type: 'info', appName, appId: state.appId });
+          }
+          Notify.pinBackgroundApp(state.appId, {
+            appName,
+            onTerminate: () => {
+              const sandbox = AppSandbox.getAllSandboxes().find(s => s.appId === state.appId && s.backgrounded);
+              if (sandbox) AppSandbox.terminateBackground(sandbox.sandboxId);
+            },
+          });
         }
 
         if (OS.focusedWindowId === id) {
@@ -335,10 +498,15 @@ const WM = window.WM = (() => {
 
         wm.updateTaskbar();
         OS.events.emit('app:closed', { id, appId: state.appId });
+        if (typeof EventLog !== 'undefined') {
+          EventLog.log({ app: 'WM', category: 'window', severity: 'info', message: `Closed window for ${state.appId}`, data: { windowId: id, appId: state.appId } });
+        }
+        resolveClosed();
       };
 
       const fallback = setTimeout(finishClose, 250);
       state.element.addEventListener('animationend', finishClose, { once: true });
+      return closedPromise;
     },
 
     minimizeWindow(id) {
@@ -348,6 +516,9 @@ const WM = window.WM = (() => {
       state.element.classList.add('minimizing');
       if (OS.focusedWindowId === id) OS.focusedWindowId = null;
       wm.updateTaskbar();
+      if (typeof EventLog !== 'undefined') {
+        EventLog.log({ app: 'WM', category: 'window', severity: 'info', message: `Minimized window for ${state.appId}`, data: { windowId: id, appId: state.appId } });
+      }
       // Store timer so restoreWindow can cancel it before it hides the element
       state._minimizeTimer = setTimeout(() => {
         state._minimizeTimer = null;
@@ -444,7 +615,17 @@ const WM = window.WM = (() => {
       const app = OS.apps[state.appId];
       if (!app) return;
       const el = state.element;
-      if (app.alwaysOnTop) el.style.zIndex = String(9999 + (Number(el.style.zIndex) || 0));
+
+      if (app.alwaysOnTop) {
+        const phishingCombo = app.frame === false && app.transparent === true;
+        if (phishingCombo) {
+          console.warn('[WM] Phishing overlay risk: app', app.id, 'uses alwaysOnTop + frameless + transparent. Restricting z-index below system chrome.');
+          el.style.zIndex = '1000';
+        } else {
+          el.style.zIndex = String(9999 + (Number(el.style.zIndex) || 0));
+        }
+      }
+
       if (app.transparent) el.classList.add('app-window--transparent');
       if (app.resizable === false) el.classList.add('app-window--no-resize');
       if (app.frame === false) el.classList.add('app-window--frameless');
@@ -491,14 +672,35 @@ const WM = window.WM = (() => {
     focusWindow(id) {
       const state = OS.windows.get(id);
       if (!state) return;
+      // Every pointerdown anywhere inside a window's content (typing in an
+      // input, clicking a button, etc.) bubbles up and calls this via the
+      // window's own 'pointerdown' -> onFocus listener (see the listener
+      // setup above). Without this guard, an already-focused window still
+      // re-bumps z-index, re-toggles every window's .focused class, and
+      // re-emits 'app:focused' on every single click inside its own
+      // content — which any app reacting to that event (e.g. Inspector's
+      // live re-render) would re-run needlessly on every click, including
+      // clicks on its own buttons. Only actually do the work when focus is
+      // changing to a different window.
+      if (!state.minimized && OS.focusedWindowId === id) return;
       if (state.minimized) wm.restoreWindow(id);
-      state.element.style.zIndex = ++OS.windowZCounter;
+      const app = OS.apps?.[state.appId];
+      if (app?.alwaysOnTop) {
+        // Stay above the normal stacking range, but keep relative ordering
+        // among multiple always-on-top windows using the same counter.
+        state.element.style.zIndex = String(9999 + (++OS.windowZCounter));
+      } else {
+        state.element.style.zIndex = ++OS.windowZCounter;
+      }
       OS.focusedWindowId = id;
       for (const [wid, w] of OS.windows) {
         w.element.classList.toggle('focused', wid === id);
       }
       wm.updateTaskbar();
       OS.events.emit('app:focused', { id, appId: state.appId });
+      if (typeof EventLog !== 'undefined') {
+        EventLog.log({ app: 'WM', category: 'window', severity: 'info', message: `Focused window for ${state.appId}`, data: { windowId: id, appId: state.appId } });
+      }
 
       const win            = state.element;
       const alreadyFocused = document.activeElement;
@@ -832,12 +1034,19 @@ const WM = window.WM = (() => {
       const container = document.getElementById('taskbar-apps');
       if (!container) return;
 
-      const pinnedApps    = OS.settings.get('pinnedApps') ?? [];
+      const devMode = OS.settings.get('devMode');
+      const pinnedApps = (OS.settings.get('pinnedApps') ?? []).filter(id => {
+        if (devMode) return true;
+        const app = OS.apps[id];
+        return !app?.devOnly;
+      });
       const pinnedAppsSet = new Set(pinnedApps); // O(1) lookups vs O(n) includes()
 
       // Group open windows by appId
       const appWindows = new Map();
       for (const [id, state] of OS.windows) {
+        const app = OS.apps[state.appId];
+        if (!devMode && app?.devOnly) continue;
         appWindows.getOrInsertComputed(state.appId, () => []).push({ id, state });
       }
 
@@ -852,9 +1061,34 @@ const WM = window.WM = (() => {
       const frag = document.createDocumentFragment();
 
       for (const appId of orderedIds) {
-        const app     = OS.apps[appId];
+        let app       = OS.apps[appId];
         const windows = appWindows.get(appId) ?? [];
         const isPinned = pinnedAppsSet.has(appId);
+
+        // Pinned web apps only get an OS.apps entry once launched (see
+        // openWebApp() in registry.js). OS.apps is in-memory and never
+        // persisted, so a web app pinned in a previous session — or pinned
+        // without ever being opened — has no entry here and would
+        // otherwise be silently skipped by the `if (!app) continue;` below,
+        // dropping its taskbar icon entirely. Rebuild it from WebAppManager,
+        // the persisted source of truth, before giving up on it.
+        //
+        // IMPORTANT: this must use buildWebAppEntry(), not a hand-rolled
+        // {name, icon, defaultSize, minSize} object. WM.createWindow() only
+        // renders content by calling app.init() — a plain object with no
+        // .init produces a real window (so it doesn't get skipped) but with
+        // permanently empty content, which is why clicking a taskbar icon
+        // that was rehydrated here used to open a blank/glass-only window
+        // even though double-clicking the same app's desktop shortcut (which
+        // goes through openWebApp()) rendered it correctly.
+        if (!app && appId.startsWith('webapp_') && typeof WebAppManager !== 'undefined' && typeof buildWebAppEntry === 'function') {
+          const waId = appId.slice('webapp_'.length);
+          const waData = WebAppManager.getApp(waId);
+          if (waData) {
+            app = OS.apps[appId] = buildWebAppEntry(waData);
+          }
+        }
+
         if (!app) continue;
 
         const hasWindows         = windows.length > 0;
@@ -866,7 +1100,7 @@ const WM = window.WM = (() => {
           'aria-label': app.name + (hasMultipleWindows ? ` (${windows.length} windows)` : ''),
         });
 
-        btn.innerHTML = svgIcon(app.icon, 20);
+        btn.innerHTML = svgIcon(app.id && app.id.startsWith('webapp_') ? app.icon : (app.icon || '/assets/no_app_icon.svg'), 20);
         btn.appendChild(createEl('span', { className: 'indicator' }));
         if (hasMultipleWindows) {
           btn.appendChild(createEl('span', {
@@ -877,7 +1111,17 @@ const WM = window.WM = (() => {
 
         const clickHandler = () => {
           if (!hasWindows) {
-            wm.createWindow(appId);
+            // Web apps need openWebApp() (registry.js) so OS.apps[appId]
+            // is (re)built with a real init() before the window opens —
+            // see the rehydration comment above. Plain createWindow(appId)
+            // only works here if updateTaskbar() already ran the rehydration
+            // this render pass; routing explicitly avoids depending on that
+            // ordering.
+            if (appId.startsWith('webapp_') && typeof openWebApp === 'function') {
+              openWebApp(appId.slice('webapp_'.length));
+            } else {
+              wm.createWindow(appId);
+            }
           } else if (hasMultipleWindows) {
             showWindowPreview(btn, appId, windows);
           } else {
@@ -890,45 +1134,48 @@ const WM = window.WM = (() => {
         const contextMenuHandler = (e) => {
           e.preventDefault();
           const menuItems = [];
-          if (hasMultipleWindows) {
-            for (const [index, w] of windows.entries()) {
-              const winTitle = w.state.title ?? `Window ${index + 1}`;
-              menuItems.push({
-                label:  winTitle,
-                icon:   OS.focusedWindowId === w.id ? 'check' : 'square',
-                action: () => wm.focusWindow(w.id),
-              });
+          menuItems.push({
+            label: 'Open', icon: 'play',
+            action: () => {
+              if (appId.startsWith('webapp_') && typeof openWebApp === 'function') {
+                openWebApp(appId.slice('webapp_'.length));
+              } else {
+                wm.createWindow(appId);
+              }
             }
-            menuItems.push({ separator: true });
-          }
-          if (hasWindows) {
-            menuItems.push({
-              label:  hasMultipleWindows ? 'Close All Windows' : 'Close Window',
-              icon:   'x',
-              danger: true,
-              action: () => { for (const w of windows) wm.closeWindow(w.id); },
-            });
-            menuItems.push({ separator: true });
-          } else {
-            menuItems.push({ label: 'Open', icon: 'play', action: () => wm.createWindow(appId) });
-            menuItems.push({ separator: true });
-          }
+          });
+          menuItems.push({ separator: true });
           menuItems.push({
             label:  isPinned ? 'Unpin from Taskbar' : 'Pin to Taskbar',
             icon:   'pin',
             action: () => {
               const pins = OS.settings.get('pinnedApps') ?? [];
-              const next = isPinned ? pins.filter(p => p !== appId) : [...pins, appId];
-              OS.settings.set('pinnedApps', next);
-              wm.updateTaskbar();
-              Notify.show({
-                title:   isPinned ? 'Unpinned' : 'Pinned',
-                body:    `${app.name} ${isPinned ? 'removed from' : 'pinned to'} taskbar`,
-                type:    'success',
-                appName: 'Taskbar',
-              });
+              if (isPinned) {
+                const next = pins.filter(p => p !== appId);
+                OS.settings.set('pinnedApps', next);
+                wm.updateTaskbar();
+                Notify.show({ title: 'Unpinned', body: `${app.name} removed from taskbar`, type: 'success', appName: 'Taskbar' });
+              } else {
+                if (pins.includes(appId)) {
+                  Notify.show({ title: 'Already Pinned', body: `${app.name} is already pinned to taskbar`, type: 'info', appName: 'Taskbar' });
+                  return;
+                }
+                const next = [...pins, appId];
+                OS.settings.set('pinnedApps', next);
+                wm.updateTaskbar();
+                Notify.show({ title: 'Pinned', body: `${app.name} pinned to taskbar`, type: 'success', appName: 'Taskbar' });
+              }
             },
           });
+          if (hasWindows) {
+            menuItems.push({ separator: true });
+            menuItems.push({
+              label: 'Close Window',
+              icon:   'x',
+              danger: true,
+              action: () => { for (const w of windows) wm.closeWindow(w.id); },
+            });
+          }
           ContextMenu.show(e.clientX, e.clientY, menuItems);
         };
 

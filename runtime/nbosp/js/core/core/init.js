@@ -84,22 +84,21 @@
     }
 
 // ── Fix CVE-NB-2026-009-M3 (2026-05-14): localStorage sensitive-key guard ──
-    // NovaByte localStorage stores only OS state (boot config, recovery flags).
-    // NEVER store auth tokens, passwords, PII, or secrets here — any XSS payload
-    // can read all localStorage keys. This guard warns loudly if a sensitive-looking
-    // key is written so accidental credential storage is caught early.
+    // Blocks writes of genuine credential material to localStorage (which is
+    // readable by any XSS payload). The regex intentionally targets patterns
+    // that are almost always secrets — password, private key, API key, etc. —
+    // and deliberately excludes overloaded terms like "session" and "token"
+    // that appear in non-secret internal state (session counters, expiry flags,
+    // token counts, recovery identifiers).
     (function () {
-      var SENSITIVE = /token|auth|secret|password|credential|session|apikey|api_key|jwt|bearer/i;
+      var SECRET = /^.*(password|private.?key|secret.?key|apikey|api_key|credential).*$/i;
       var _realSet = localStorage.setItem.bind(localStorage);
       localStorage.setItem = function (key, value) {
-        if (SENSITIVE.test(key)) {
-          var msg = '[NovaByte] SECURITY: Refusing to store sensitive key "' + key +
+        if (SECRET.test(key)) {
+          var msg = '[NovaByte] SECURITY: Refusing to store key "' + key +
             '" in localStorage (XSS-readable). Use a server-side session instead.';
-          if (window.__NOVA_DEBUG) {
-            console.warn(msg); // warn in dev, allow through
-            return _realSet(key, value);
-          }
-          throw new Error(msg); // hard-fail in production
+          console.error(msg);
+          throw new Error(msg);
         }
         return _realSet(key, value);
       };
@@ -120,19 +119,16 @@
     });
 
     // ── Production console guard (CVE-NB-2026-009-H6, 2026-05-14) ──────────────
-    // Suppress all console output in production to prevent information disclosure
+    // Suppress noisy console output in production to prevent information disclosure
     // via DevTools (internal paths, state values, API endpoints).
     // Set window.__NOVA_DEBUG = true in a local .env or browser console to re-enable.
+    // NOTE: console.error is intentionally preserved — errors must still surface.
     (function () {
       if (typeof window.__NOVA_DEBUG === 'undefined' || !window.__NOVA_DEBUG) {
         var noop = function () { };
         ['log', 'info', 'warn', 'debug', 'group', 'groupEnd', 'groupCollapsed', 'table', 'dir'].forEach(function (m) {
           try { console[m] = noop; } catch (e) { }
         });
-        // Keep console.error for genuine unhandled errors but strip message content
-        console.error = function () {
-          // Only emit in dev; in prod swallow to avoid leaking stack traces
-        };
       }
     })();
 
@@ -199,7 +195,7 @@
             '</div>',
             '</div>',
             '<div class="rba-title">NovaByte</div>',
-            '<div class="rba-subtitle">\u26a0 Recovery Mode v2.0</div>',
+            '<div class="rba-subtitle">\u26a0 Recovery Mode</div>',
             '<div class="rba-log" id="rba-log"></div>',
             '<div class="rba-bar-wrap"><div class="rba-bar" id="rba-bar"></div></div>',
             '<div class="rba-status" id="rba-status">Initializing recovery environment\u2026</div>',
@@ -213,7 +209,7 @@
           var step = 0;
           var steps = [
             { msg: '[ RECOVERY MODE TRIGGERED ]', cls: 'warn', pct: 8, label: 'Loading recovery kernel\u2026' },
-            { msg: '\u2713 Recovery environment v2.0 loaded', cls: 'ok', pct: 22, label: 'Mounting storage\u2026' },
+            { msg: '\u2713 Recovery environment loaded', cls: 'ok', pct: 22, label: 'Mounting storage\u2026' },
             { msg: '\u2713 localStorage integrity check\u2026', cls: 'ok', pct: 38, label: 'Checking data\u2026' },
             { msg: '\u26a0 Boot failure detected \u2014 entering recovery', cls: 'warn', pct: 60, label: 'Preparing interface\u2026' },
             { msg: '\u2713 Recovery UI ready', cls: 'ok', pct: 88, label: 'Almost ready\u2026' },
@@ -448,7 +444,7 @@
           recLog('Safe mode: ' + (localStorage.getItem('nova_safe_mode') === '1' ? 'ON' : 'off'), 'ok');
         },
         ls: () => { const keys = Object.keys(localStorage); if (!keys.length) { recLog('(empty)', 'warn'); return; } keys.forEach(k => recLog('  ' + k + ' — ' + localStorage.getItem(k).length + ' chars', 'ok')); },
-        env: () => { recLog('── Environment ──', 'info'); recLog('UA: ' + navigator.userAgent.slice(0, 80), 'ok'); recLog('Lang: ' + navigator.language, 'ok'); recLog('Cores: ' + (navigator.hardwareConcurrency || '?'), 'ok'); recLog('Online: ' + navigator.onLine, navigator.onLine ? 'ok' : 'warn'); recLog('Screen: ' + screen.width + 'x' + screen.height, 'ok'); recLog('Time: ' + new Date().toISOString(), 'ok'); },
+        env: () => { recLog('── Environment ──', 'info'); recLog('UA: ' + navigator.userAgent.slice(0, 80), 'ok'); recLog('Lang: ' + ((typeof OS !== 'undefined' && OS.settings && typeof OS.settings.get === 'function') ? OS.settings.get('region') : navigator.language), 'ok'); recLog('Cores: ' + (navigator.hardwareConcurrency || '?'), 'ok'); recLog('Online: ' + navigator.onLine, navigator.onLine ? 'ok' : 'warn'); recLog('Screen: ' + screen.width + 'x' + screen.height, 'ok'); recLog('Time: ' + new Date().toISOString(), 'ok'); },
         'clear-boot': () => { localStorage.removeItem('nova_boot_attempts'); recLog('Boot counter cleared', 'ok'); },
         meminfo: () => { if (performance.memory) { const mb = n => (n / 1024 / 1024).toFixed(1) + ' MB'; recLog('Heap Used: ' + mb(performance.memory.usedJSHeapSize), 'ok'); recLog('Heap Total: ' + mb(performance.memory.totalJSHeapSize), 'ok'); recLog('Heap Limit: ' + mb(performance.memory.jsHeapSizeLimit), 'ok'); } else recLog('performance.memory not available', 'warn'); },
         clear: () => { const el = document.getElementById('rec-diag-lines'); if (el) el.innerHTML = ''; },
@@ -563,7 +559,6 @@
         recLog('Continuing to NovaByte...', 'info');
         localStorage.removeItem(BOOT_ATTEMPT_KEY);
         localStorage.removeItem(RECOVERY_FORCE_KEY);
-        document.getElementById('recovery-screen').classList.remove('active');
         setTimeout(() => location.reload(), 800);
 
       } else if (action === 'safemode') {
@@ -703,7 +698,18 @@
             }
           } catch { }
         };
-        (async () => { await deleteDbs(); await clearOPFS(); location.reload(); })();
+        // .novaapp data lives in per-app webview storage partitions
+        // (persist:app_<id> — see app-sandbox.js createSandbox()), separate
+        // from localStorage/IndexedDB/OPFS and untouched above.
+        const clearAppPartitions = async () => {
+          try {
+            const appIds = (typeof OS !== 'undefined' && OS.apps) ? Object.keys(OS.apps) : [];
+            if (typeof AppSandbox !== 'undefined' && AppSandbox.clearAppPartitions) {
+              await AppSandbox.clearAppPartitions(appIds);
+            }
+          } catch { }
+        };
+        (async () => { await deleteDbs(); await clearOPFS(); await clearAppPartitions(); location.reload(); })();
 
       }
     };

@@ -1682,6 +1682,33 @@
       animation: iconAppear 0.4s cubic-bezier(0.34, 1.56, 0.64, 1) backwards;
     }
 
+    .desktop-icon.dragging {
+      position: fixed;
+      z-index: 99999 !important;
+      pointer-events: none;
+    }
+
+    .pin-plus-badge {
+      position: absolute;
+      top: -8px;
+      right: -8px;
+      width: 22px;
+      height: 22px;
+      background: #22c55e;
+      border: 2px solid #fff;
+      border-radius: 50%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: #fff;
+      font-size: 15px;
+      font-weight: bold;
+      line-height: 1;
+      box-shadow: 0 2px 6px rgba(0, 0, 0, 0.35);
+      z-index: 5;
+      pointer-events: none;
+    }
+
     @keyframes iconAppear {
       0% {
         transform: scale(0) rotate(-10deg);
@@ -1762,6 +1789,14 @@
       align-items: center;
       padding: 0 8px;
       transition: transform 280ms var(--ease-macos), opacity 280ms var(--ease-macos);
+    }
+
+    #taskbar.drag-over {
+      box-shadow: 0 -4px 30px var(--accent), 0 0 60px rgba(var(--accent-rgb, 59, 130, 246), 0.35);
+    }
+    #taskbar.drag-over::before {
+      border-top-color: var(--accent);
+      box-shadow: inset 0 1px 0 var(--accent), 0 0 20px var(--accent);
     }
 
     /* Taskbar glass layer: backdrop-filter + SVG distortion */
@@ -2533,8 +2568,15 @@
     }
 
     .app-window--frameless .window-titlebar {
+      height: 8px;
+      padding: 0;
       border-bottom: none;
       background: transparent;
+    }
+
+    .app-window--frameless .window-titlebar-icon,
+    .app-window--frameless .window-titlebar-text {
+      display: none;
     }
 
     .app-window--frameless .window-controls {
@@ -2542,9 +2584,12 @@
     }
 
     .app-window--transparent {
-      background: transparent;
       border: 1px solid rgba(255, 255, 255, 0.12);
       box-shadow: none;
+    }
+
+    .app-window--transparent::before {
+      display: none;
     }
 
     .app-window--transparent .window-titlebar {
@@ -2678,8 +2723,6 @@
       position: absolute;
       background: rgba(88, 166, 255, 0.05);
       border: 1px solid rgba(88, 166, 255, 0.18);
-      backdrop-filter: blur(8px);
-      -webkit-backdrop-filter: blur(8px);
       transition: background calc(120ms * var(--anim-speed)) ease,
                   border-color calc(120ms * var(--anim-speed)) ease,
                   box-shadow calc(120ms * var(--anim-speed)) ease;
@@ -2695,22 +2738,23 @@
     /* Corners: 68×58px boxes */
     .sc-zone[data-zone="top-left"]     { top: 5px; left: 5px; width: 68px; height: 58px; border-radius: 0 0 var(--r-sm) 0; }
     .sc-zone[data-zone="top-right"]    { top: 5px; right: 5px; width: 68px; height: 58px; border-radius: 0 0 0 var(--r-sm); }
-    .sc-zone[data-zone="bottom-left"]  { bottom: 5px; left: 5px; width: 68px; height: 58px; border-radius: 0 var(--r-sm) 0 0; }
-    .sc-zone[data-zone="bottom-right"] { bottom: 5px; right: 5px; width: 68px; height: 58px; border-radius: var(--r-sm) 0 0 0; }
+    .sc-zone[data-zone="bottom-left"]  { bottom: calc(var(--taskbar-height, 48px) + 5px); left: 5px; width: 68px; height: 58px; border-radius: 0 var(--r-sm) 0 0; }
+    .sc-zone[data-zone="bottom-right"] { bottom: calc(var(--taskbar-height, 48px) + 5px); right: 5px; width: 68px; height: 58px; border-radius: var(--r-sm) 0 0 0; }
 
-    /* Edge strips */
+    /* Edge strips — left/right stop at the top of the bottom corners so they
+       don't visually overlap the bottom hint boxes. */
     .sc-zone[data-zone="top"]    { top: 5px; left: 79px; right: 79px; height: 22px; border-radius: 0 0 var(--r-xs) var(--r-xs); }
-    .sc-zone[data-zone="bottom"] { bottom: 5px; left: 79px; right: 79px; height: 22px; border-radius: var(--r-xs) var(--r-xs) 0 0; }
-    .sc-zone[data-zone="left"]   { left: 5px; top: 69px; bottom: 69px; width: 22px; border-radius: 0 var(--r-xs) var(--r-xs) 0; }
-    .sc-zone[data-zone="right"]  { right: 5px; top: 69px; bottom: 69px; width: 22px; border-radius: var(--r-xs) 0 0 var(--r-xs); }
+    .sc-zone[data-zone="bottom"] { bottom: calc(var(--taskbar-height, 48px) + 5px); left: 79px; right: 79px; height: 22px; border-radius: var(--r-xs) var(--r-xs) 0 0; }
+    .sc-zone[data-zone="left"]   { left: 5px; top: 69px; bottom: calc(var(--taskbar-height, 48px) + 69px); width: 22px; border-radius: 0 var(--r-xs) var(--r-xs) 0; }
+    .sc-zone[data-zone="right"]  { right: 5px; top: 69px; bottom: calc(var(--taskbar-height, 48px) + 69px); width: 22px; border-radius: var(--r-xs) 0 0 var(--r-xs); }
 
 
     .context-menu {
       position: fixed;
       z-index: var(--z-popup);
       /* Liquid Glass */
-      background: rgba(255, 255, 255, 0.07);
-      border: 1px solid rgba(255, 255, 255, 0.22);
+      background: rgba(255, 255, 255, 0.3);
+      border: 1px solid rgba(255, 255, 255, 0.5);
       border-radius: var(--r-lg);
       box-shadow:
         inset 0 1.5px 0 rgba(255, 255, 255, 0.42),
@@ -2791,6 +2835,26 @@
 
     .ctx-item.danger {
       color: var(--text-danger);
+    }
+
+    .context-menu.light-bg .ctx-item {
+      color: #1a1a1a;
+    }
+
+    .context-menu.light-bg .ctx-item:hover {
+      background: rgba(0, 0, 0, 0.08);
+    }
+
+    .context-menu.light-bg .ctx-item.danger {
+      color: #c41e1e;
+    }
+
+    .context-menu.light-bg .ctx-shortcut {
+      color: #555;
+    }
+
+    .context-menu.light-bg .ctx-separator {
+      background: rgba(0, 0, 0, 0.15);
     }
 
     .ctx-item .ctx-shortcut {
@@ -2980,6 +3044,13 @@
       color: var(--text-primary);
     }
 
+    .launchpad-name mark {
+      background: var(--accent);
+      color: #fff;
+      border-radius: 2px;
+      padding: 0 2px;
+    }
+
     /* ── NOTIFICATION TOAST ── */
     .toast-container {
       position: fixed;
@@ -3130,7 +3201,7 @@
       backdrop-filter: blur(12px) saturate(220%) brightness(108%);
       -webkit-backdrop-filter: blur(12px) saturate(220%) brightness(108%);
       filter: url(#glass-distortion-soft);
-      background: rgba(255, 255, 255, 0.10);
+      background: rgba(255, 255, 255, 0.18);
       pointer-events: none;
     }
 
@@ -3179,6 +3250,12 @@
       font-weight: 600;
     }
 
+    .notif-header-actions {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
     .notif-list {
       flex: 1;
       overflow-y: auto;
@@ -3201,6 +3278,45 @@
       border-color: rgba(255, 255, 255, 0.14);
     }
 
+    .notif-item.read {
+      background: rgba(255, 255, 255, 0.02);
+      border-color: rgba(255, 255, 255, 0.05);
+    }
+
+    .notif-item.read .notif-item-title,
+    .notif-item.read .notif-item-body,
+    .notif-item.read .notif-item-time {
+      opacity: 0.55;
+    }
+
+    .notif-item.read:hover {
+      background: rgba(255, 255, 255, 0.05);
+      border-color: rgba(255, 255, 255, 0.09);
+    }
+
+    .notif-item-pinned.read {
+      background: rgba(88, 166, 255, 0.04);
+      border-color: rgba(88, 166, 255, 0.15);
+    }
+
+    .notif-item-pinned.read:hover {
+      background: rgba(88, 166, 255, 0.08);
+      border-color: rgba(88, 166, 255, 0.25);
+    }
+
+    /* Pinned entries report an ongoing state (an app running in the
+       background), not a past event — the accent border + tint keeps them
+       visually distinct from the rest of the list they sort above. */
+    .notif-item-pinned {
+      background: rgba(88, 166, 255, 0.08);
+      border-color: rgba(88, 166, 255, 0.3);
+    }
+
+    .notif-item-pinned:hover {
+      background: rgba(88, 166, 255, 0.13);
+      border-color: rgba(88, 166, 255, 0.4);
+    }
+
     .notif-item-content {
       flex: 1;
     }
@@ -3220,6 +3336,81 @@
       font-size: 11px;
       color: var(--text-muted);
       margin-top: 4px;
+    }
+
+    .notif-item-dismiss {
+      width: 28px;
+      height: 28px;
+      border-radius: 6px;
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      background: rgba(255, 255, 255, 0.04);
+      color: var(--text-muted);
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      transition: all 0.15s;
+    }
+
+    .notif-item-dismiss:hover {
+      background: rgba(255, 255, 255, 0.1);
+      color: var(--text-primary);
+    }
+
+    .notification-panel.light-bg .notif-header h3,
+    .notification-panel.light-bg .notif-item-title {
+      color: #1a1a1a;
+    }
+
+    .notification-panel.light-bg .notif-item-body,
+    .notification-panel.light-bg .notif-item-time {
+      color: #444;
+    }
+
+    .notification-panel.light-bg .notif-item {
+      background: rgba(0, 0, 0, 0.04);
+      border-color: rgba(0, 0, 0, 0.08);
+    }
+
+    .notification-panel.light-bg .notif-item:hover {
+      background: rgba(0, 0, 0, 0.08);
+      border-color: rgba(0, 0, 0, 0.14);
+    }
+
+    .notification-panel.light-bg .notif-item.read {
+      background: rgba(0, 0, 0, 0.02);
+      border-color: rgba(0, 0, 0, 0.05);
+    }
+
+    .notification-panel.light-bg .notif-item.read:hover {
+      background: rgba(0, 0, 0, 0.05);
+      border-color: rgba(0, 0, 0, 0.09);
+    }
+
+    .notification-panel.light-bg .notif-item-pinned.read {
+      background: rgba(88, 166, 255, 0.04);
+      border-color: rgba(88, 166, 255, 0.15);
+    }
+
+    .notification-panel.light-bg .notif-item-pinned.read:hover {
+      background: rgba(88, 166, 255, 0.08);
+      border-color: rgba(88, 166, 255, 0.25);
+    }
+
+    .notification-panel.light-bg .notif-item-dismiss {
+      background: rgba(0, 0, 0, 0.04);
+      border-color: rgba(0, 0, 0, 0.08);
+      color: #666;
+    }
+
+    .notification-panel.light-bg .notif-item-dismiss:hover {
+      background: rgba(0, 0, 0, 0.08);
+      color: #1a1a1a;
+    }
+
+    .notification-panel.light-bg .notif-header {
+      background: rgba(0, 0, 0, 0.04);
+      border-bottom-color: rgba(0, 0, 0, 0.10);
     }
 
     /* ── VOLUME POPUP ── */
@@ -3265,6 +3456,8 @@
       inset: 0;
       z-index: 99000;
       background: rgba(0, 0, 0, 0.5);
+      backdrop-filter: blur(6px);
+      -webkit-backdrop-filter: blur(6px);
       display: flex;
       align-items: center;
       justify-content: center;
@@ -5798,6 +5991,73 @@
       background: rgba(10, 10, 10, 0.80) !important;
     }
 
+    /* ── Remove Transparency mode ──────────────────────────────────────────
+       Unlike .no-glass (High Contrast, which dims but keeps ~50-80% alpha),
+       this pushes every glass/translucent surface to fully solid (alpha 1)
+       and strips all blur, so nothing behind a window/menu/toast shows
+       through. Overriding the custom properties at the root covers every
+       selector that consumes --bg-elevated/--window-bg/etc (~20+ surfaces)
+       instead of chasing each one individually. */
+    .no-transparency {
+      --bg-elevated: #0e121c;
+      --bg-overlay: #141a28;
+      --bg-sunken: #030508;
+      --window-bg: #0a0e16;
+      --taskbar-bg: #060a12;
+      --bg-sidebar: #04060c;
+      --bg-hover: #262a33;
+      --glass-bg: #0a0e16;
+      --lg-bg: #1c1c1c;
+      --accent-muted: #1c3352;
+      --window-blur: none;
+      --lg-blur: none;
+    }
+
+    .no-transparency *,
+    .no-transparency *::before,
+    .no-transparency *::after {
+      backdrop-filter: none !important;
+      -webkit-backdrop-filter: none !important;
+    }
+
+    .no-transparency .window,
+    .no-transparency .app-window,
+    .no-transparency #taskbar,
+    .no-transparency .taskbar,
+    .no-transparency .context-menu,
+    .no-transparency .notification-toast,
+    .no-transparency .modal-dialog,
+    .no-transparency .modal-overlay {
+      background-color: var(--bg-elevated) !important;
+      opacity: 1 !important;
+    }
+
+    /* Windows (and similar) paint their actual glass via a ::before pseudo-
+       element at z-index:-1, not the element's own background — killing
+       backdrop-filter on it alone leaves an unblurred, still-see-through
+       tint behind. Force it solid too. Taskbar and the notification panel
+       use the identical pattern. */
+    .no-transparency .app-window::before,
+    .no-transparency #taskbar::before,
+    .no-transparency #notification-panel::before {
+      background: var(--bg-elevated) !important;
+      filter: none !important;
+    }
+
+    /* Launchpad and its icons set their own standalone rgba backgrounds
+       rather than consuming --bg-elevated, so the root var swap above
+       doesn't reach them. */
+    .no-transparency #launchpad,
+    .no-transparency .launchpad-icon,
+    .no-transparency .context-menu {
+      background: var(--bg-elevated) !important;
+    }
+
+    .no-transparency #taskbar,
+    .no-transparency .taskbar {
+      background-color: var(--taskbar-bg) !important;
+    }
+
     .nook-toggle-row {
       display: flex;
       align-items: center;
@@ -5986,7 +6246,7 @@
 
     /* ── TOGGLE SWITCH (macOS style) ── */
     .toggle {
-      width: 40px;
+      width: 44px;
       height: 22px;
       border-radius: 11px;
       background: var(--text-muted);
@@ -6017,7 +6277,7 @@
     }
 
     .toggle.active::after {
-      transform: translateX(18px);
+      transform: translateX(22px);
     }
 
     .toggle:focus-visible {
@@ -6029,7 +6289,7 @@
     }
 
     .toggle.active:active::after {
-      transform: translateX(18px) scale(0.9);
+      transform: translateX(22px) scale(0.9);
     }
 
     /* ── CHECKBOX (macOS style) ── */
@@ -6470,4 +6730,41 @@
 
     .speed-dial-tile:hover {
       background: var(--bg-hover) !important;
+    }
+
+    /* ── Debug Overlay ── */
+    #debug-overlay {
+      position: fixed;
+      z-index: 99999;
+      font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace;
+      font-size: 12px;
+      line-height: 1.5;
+      color: #0f0;
+      background: transparent;
+      padding: 6px 10px;
+      border-radius: 6px;
+      pointer-events: none;
+      user-select: none;
+      white-space: pre;
+      text-shadow: 0 0 6px rgba(0, 0, 0, 0.95), 0 0 3px rgba(0, 0, 0, 0.8), 1px 1px 0 rgba(0,0,0,0.9);
+      transition: opacity 0.2s;
+    }
+
+    #debug-overlay .debug-drag-handle {
+      cursor: grab;
+      pointer-events: auto;
+      touch-action: none;
+      padding: 4px 10px 2px;
+      box-sizing: border-box;
+      border-bottom: 1px solid rgba(0, 255, 0, 0.15);
+      margin-bottom: 4px;
+    }
+
+    #debug-overlay .debug-drag-handle:active {
+      cursor: grabbing;
+    }
+
+    #debug-overlay .debug-content {
+      pointer-events: none;
+      padding: 0 10px 6px;
     }

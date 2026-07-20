@@ -1,5 +1,6 @@
 registerApp({
         id: 'nbosp-email', name: 'Email', icon: 'mail',
+        version: '3.0.2',
         description: 'IMAP · POP3 · Exchange',
         defaultSize: [860, 580], minSize: [600, 420],
         init(content, state, options) {
@@ -727,7 +728,7 @@ registerApp({
             const bodyEl = createEl('div', { className: 'em-reader-body' });
             if (full.html) {
               // The server sanitises full.html in GET /message before returning it
-              // (rewriteEmailImages + rewriteEmailLinks + sanitizeEmailHtml).
+              // (sanitizeEmailHtml).
               // Set srcdoc directly — no token round-trip, no NW.js iframe-src issues.
               const iframe = createEl('iframe', {
                 sandbox: 'allow-popups allow-popups-to-escape-sandbox',

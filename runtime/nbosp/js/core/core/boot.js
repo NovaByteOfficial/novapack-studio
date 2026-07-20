@@ -141,7 +141,7 @@ const Boot = {
     let _prefsFileId = null; // cached after first successful lookup
     OS.settings.set = function settingSet(key, value) {
       _orig(key, value);
-      const folderId = AppDirs.getVFSDir('com.nbosp.settings', 'shared_prefs');
+      const folderId = window.AppDirs?.getVFSDir?.('com.nbosp.settings', 'shared_prefs');
       if (!folderId) return;
       const content = JSON.stringify(OS.settings._cache, null, 2);
       if (_prefsFileId) {
@@ -171,9 +171,9 @@ const Boot = {
    * @param {boolean} isSafeMode
    */
   async initSubsystems(isSafeMode) {
-    OS.workers.fs     = createWorker(FS_WORKER_CODE);
-    OS.workers.search = createWorker(SEARCH_WORKER_CODE);
-    OS.workers.crypto = createWorker(CRYPTO_WORKER_CODE);
+    OS.workers.fs     = createWorker(FS_WORKER_CODE, 'fs');
+    OS.workers.search = createWorker(SEARCH_WORKER_CODE, 'search');
+    OS.workers.crypto = createWorker(CRYPTO_WORKER_CODE, 'crypto');
 
     // fs must init before the rest depend on it
     await OS.workers.fs.call('init');
@@ -185,8 +185,8 @@ const Boot = {
     });
 
     await FS.init();
-    await AppDirs.bootstrap();
-    await OPFS.init();
+    await window.AppDirs?.bootstrap?.();
+    await window.OPFS?.init?.();
 
     window.__NB_RUNTIME.ready = true;
     Boot._patchSettingsSet();
@@ -264,6 +264,7 @@ const Boot = {
   applyAccessibility(sGet) {
     const { rootClasses } = Boot._dom;
     if (sGet('highContrast')) rootClasses.add('no-glass');
+    if (sGet('removeTransparency')) rootClasses.add('no-transparency');
     if (sGet('reduceMotion')) {
       rootClasses.add('reduce-motion');
       const wpEl = document.getElementById('wallpaper');
@@ -404,7 +405,7 @@ async function boot() {
   const isManualRecovery = Storage.checkFlag(KEYS.MANUAL_REC) || Storage.checkFlag(KEYS.SHOW_REC);
   if (isManualRecovery || forceRecovery) {
     Storage.removeAll(KEYS.MANUAL_REC, KEYS.SHOW_REC, KEYS.FORCE);
-    showRecoveryScreen(forceRecovery ? Storage.get(KEYS.ATTEMPTS, []) : []);
+    showRecoveryScreen(forceRecovery ? Storage.get(KEYS.ATTEMPTS, []) : [], isManualRecovery && !forceRecovery);
     watchdog.complete();
     return;
   }
@@ -414,7 +415,7 @@ async function boot() {
   const isSafeMode    = Storage.checkFlag(KEYS.SAFE_MODE);
 
   if (priorAttempts.length >= BOOT_THRESHOLD && !isSafeMode) {
-    showRecoveryScreen(priorAttempts);
+    showRecoveryScreen(priorAttempts, false);
     watchdog.complete();
     return;
   }
@@ -472,7 +473,34 @@ async function boot() {
     ? (fn) => requestIdleCallback(fn, { timeout: 3000 })
     : (fn) => setTimeout(fn, 0);
   scheduleIdle(() => {
-    loadInstalledNovaApps().catch(e => console.error('[BOOT] Failed to load installed Nova apps:', e));
+    loadInstalledNovaApps().catch(e => console.error('[BOOT] Failed to load installed Nova apps:', e)).finally(() => {
+      if (typeof WM !== 'undefined' && typeof WM.updateTaskbar === 'function') WM.updateTaskbar();
+      // loadInstalledNovaApps() is fire-and-forget from an idle callback and
+      // races the fixed 800ms boot-finalize delay below — hydrateApps() does
+      // async per-file OPFS reads per installed app and can easily lose that
+      // race, especially right after an install/replace when OPFS state just
+      // changed. Desktop icons and the launchpad had nothing re-render them
+      // once this actually finished (only the taskbar did above), so a
+      // freshly-installed/replaced app's icon and content stayed stale until
+      // something unrelated (e.g. opening App Manager) happened to redraw
+      // them later against already-fresh OS.apps/APP_REGISTRY data.
+      if (typeof renderDesktopIcons === 'function') renderDesktopIcons();
+      if (typeof renderLaunchpad === 'function') renderLaunchpad();
+      // Apps only launch here once they're guaranteed to be registered in
+      // AppRegistry/OS.apps (loadInstalledNovaApps has just finished above)
+      // — launchAutostartApps() checks disabled/permission state itself and
+      // is a no-op for anyone with nothing eligible, so it's safe to always
+      // call.
+      launchAutostartApps();
+
+      // Tier-1 scheduled background wake (system:background). Started once
+      // here, not re-armed elsewhere — AppScheduler.start() is itself a
+      // no-op on repeat calls, so this is just the one place boot always
+      // reaches after apps are registered.
+      if (typeof AppScheduler !== 'undefined') {
+        AppScheduler.start();
+      }
+    });
   });
 
   // 9. Finalize ────────────────────────────────────────────────────
@@ -492,6 +520,23 @@ async function boot() {
 
   // 10. Post-boot Hooks ────────────────────────────────────────────
   Boot._runHooks('after');
+
+  // 11. Developer Mode / Debug Overlay ───────────────────────────
+  if (OS.settings.get('devMode')) {
+    const overlayPref = OS.settings.get('debugOverlayVisible');
+    if (overlayPref !== false && window.DebugOverlay) {
+      window.DebugOverlay.enable();
+    }
+  }
+
+  // Freeze hooks to prevent post-boot tampering. Any script that tries to push
+  // onto Boot.hooks after this point will receive a TypeError.
+  try {
+    Object.freeze(Boot.hooks.before);
+    Object.freeze(Boot.hooks.after);
+    Object.freeze(Boot.hooks.onError);
+    Object.freeze(Boot.hooks);
+  } catch (e) { /* non-fatal */ }
 }
 
 // ── App Loader ─────────────────────────────────────────────────────
@@ -500,128 +545,37 @@ async function boot() {
  * Called at idle time after boot — safe to call manually if needed.
  */
   function registerWithFiles(appData) {
-    let icon = appData.icon || 'box';
-    if (icon && !/^data:|^https?:\/\//i.test(icon) && appData.files?.[icon]) {
-      const encoded = appData.files[icon];
-      const ext = (icon.split('.').pop() || '').toLowerCase();
-      const mime = ext === 'svg' ? 'image/svg+xml'
-        : ext === 'jpg' || ext === 'jpeg' ? 'image/jpeg'
-        : ext === 'gif' ? 'image/gif'
-        : ext === 'webp' ? 'image/webp'
-        : ext === 'ico' ? 'image/x-icon'
-        : 'image/png';
-      icon = `data:${mime};base64,${encoded}`;
+    if (!appData?.id || !appData.files) return;
+
+    try {
+      if (typeof window.buildNovaAppConfig !== 'function') {
+        // appmanager.js loads before boot.js in index.html, so this should
+        // never actually happen — but if script order ever changes, fail
+        // loudly instead of silently falling back to the old incomplete
+        // registration path (which is exactly how this bug shipped once).
+        console.error('[BOOT] window.buildNovaAppConfig unavailable — cannot register', appData.id, 'with full launch config. Check that appmanager.js loads before boot.js.');
+        return;
+      }
+
+      const cfg = window.buildNovaAppConfig(appData);
+      OS.apps[appData.id] = cfg;
+      const ri = APP_REGISTRY.findIndex(a => a.id === appData.id);
+      if (ri > -1) APP_REGISTRY[ri] = cfg;
+      else APP_REGISTRY.push(cfg);
+
+      // Deliberately NOT calling AppRegistry.registerApp() here — it
+      // unconditionally rebuilds and overwrites OS.apps[id] with its own
+      // config (no files/entry), which would immediately clobber the
+      // correct cfg set above. PackageStore's registry (nova_installed_apps)
+      // is already the real persisted source of truth for installed apps;
+      // AppRegistry's separate cache isn't load-bearing for this path.
+
+      if (window.AppDirs && typeof window.AppDirs.ensureAppDataFolder === 'function') {
+        window.AppDirs.ensureAppDataFolder(appData.id).catch(() => {});
+      }
+    } catch (e) {
+      console.warn('[BOOT] Failed to register installed app', appData.id, e);
     }
-
-    const cfg = {
-      id: appData.id,
-      name: appData.name,
-      icon,
-      description: appData.description || '',
-      defaultSize: appData.defaultSize || [800, 560],
-      minSize: appData.minSize || [400, 300],
-      minSecurityPatch: appData.minSecurityPatch || null,
-      permissions: appData.permissions || [],
-      optionalPermissions: appData.optionalPermissions || [],
-      async init(contentEl) {
-        const _requiredPerms = appData.permissions || [];
-        const _optionalPerms = appData.optionalPermissions || [];
-        const _allDangerous  = [..._requiredPerms, ..._optionalPerms];
-        if (_allDangerous.length > 0 && typeof AppPermissionManager !== 'undefined') {
-          const _mgr     = AppPermissionManager;
-          const _missing = _allDangerous.filter(p =>
-            !_mgr.isGranted(p, appData.id) && !(_mgr.isDenied && _mgr.isDenied(p, appData.id))
-          );
-          if (_missing.length > 0) {
-            await _mgr.requestAll(_missing, appData.id, appData.name || appData.id);
-          }
-        }
-
-        const entryKey = appData.entry || 'index.html';
-        const rawEntry = appData.files?.[entryKey];
-        if (!rawEntry) {
-          contentEl.innerHTML = '<div style="padding:24px;color:var(--text-danger);font-family:monospace;">Entry file not found in package.</div>';
-          return;
-        }
-        let html;
-        try {
-          html = decodeURIComponent(
-            atob(rawEntry).split('').map(c => '%' + c.charCodeAt(0).toString(16).padStart(2, '0')).join('')
-          );
-        } catch (e) {
-          contentEl.innerHTML = `<div style="padding:24px;color:var(--text-danger);font-family:monospace;">Failed to load app: ${e.message}</div>`;
-          return;
-        }
-
-        if (!appData._cachedHtml) appData._cachedHtml = html;
-
-        const shimmedFiles = Object.assign({}, appData.files);
-        shimmedFiles[entryKey] = btoa(
-          encodeURIComponent(html).replace(/%([0-9A-F]{2})/g, (_, h) => String.fromCharCode(parseInt(h, 16)))
-        );
-
-        const origin = (typeof window.location !== 'undefined' && window.location.origin)
-          ? window.location.origin
-          : 'http://127.0.0.1:3003';
-
-        const sandboxId = 'sandbox_' + appData.id.replace(/[^a-zA-Z0-9_-]/g, '_') + '_' + Date.now();
-        let baseUrl = '/api/apps/serve/' + sandboxId + '/';
-        let webview;
-        try {
-          const regRes = await fetch('/api/apps/serve/register', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ sandboxId, files: shimmedFiles })
-          });
-          if (!regRes.ok) throw new Error('serve register failed: ' + regRes.status);
-          const regData = await regRes.json();
-          baseUrl = regData.baseUrl || baseUrl;
-          const encodedEntry = String(entryKey).split('/').map(encodeURIComponent).join('/');
-          const serveBaseUrl = String(baseUrl).replace(/\/+$/, '');
-          const url = origin + serveBaseUrl + '/' + encodedEntry;
-
-          webview = createEl('webview', {
-            src    : url,
-            style  : 'width:100%;height:100%;border:none;display:block;'
-          });
-          if (webview.tagName !== 'WEBVIEW' && typeof FrameSecurity !== 'undefined' && typeof FrameSecurity.securifyFrame === 'function') {
-            FrameSecurity.securifyFrame(webview);
-          }
-          webview.dataset.novaServed = '1';
-        } catch (e) {
-          console.error('[NovaApp] serve-register failed for', appData.id, 'falling back to blob:', e);
-          try {
-            const blob = new Blob([html], { type: 'text/html' });
-            const blobUrl = URL.createObjectURL(blob);
-            webview = createEl('webview', {
-              src    : blobUrl,
-              style  : 'width:100%;height:100%;border:none;display:block;'
-            });
-            if (webview.tagName !== 'WEBVIEW' && typeof FrameSecurity !== 'undefined' && typeof FrameSecurity.securifyFrame === 'function') {
-              FrameSecurity.securifyFrame(webview);
-            }
-            webview.dataset.novaBlobUrl = blobUrl;
-          } catch (blobErr) {
-            contentEl.innerHTML = `<div style="padding:24px;color:var(--text-danger);font-family:monospace;">Failed to load app: ${blobErr.message}</div>`;
-            return;
-          }
-        }
-
-        webview.addEventListener('did-fail-load', (e) => {
-          console.error('[NovaApp] webview load failed', appData.id, (typeof serveBaseUrl === 'string' ? serveBaseUrl : baseUrl) + '/' + (typeof encodedEntry === 'string' ? encodedEntry : entryKey), e);
-        });
-        webview.addEventListener('did-finish-load', () => {
-          console.log('[NovaApp] webview loaded', appData.id);
-        });
-        contentEl.style.padding = '0';
-        contentEl.appendChild(webview);
-      },
-    };
-
-    OS.apps[appData.id] = cfg;
-    const ri = APP_REGISTRY.findIndex(app => app.id === appData.id);
-    if (ri > -1) APP_REGISTRY[ri] = cfg;
-    else APP_REGISTRY.push(cfg);
   }
 
   async function loadInstalledNovaApps() {
@@ -632,13 +586,298 @@ async function boot() {
 
     for (let i = 0; i < apps.length; i++) {
       const appData = apps[i];
-      if (OS.apps[appData.id]) continue;
+      if (OS.apps[appData.id] && APP_REGISTRY.some(a => a.id === appData.id)) continue;
       if (!appData.files) {
         console.warn('[BOOT] Installed package files missing for', appData.id);
         continue;
       }
       registerWithFiles(appData);
     }
+
+    // ── Post-install revocation re-check ──────────────────────────
+    // verifyAgainstTrustStore only ever ran once, at install time. If
+    // NovaByte revokes a signature *after* someone already installed
+    // that app, nothing previously re-checked it — the app just kept
+    // running as "verified" forever, silently. This scan runs on every
+    // boot so a newly-revoked app gets surfaced the next time NBOSP
+    // starts, regardless of whether App Manager is ever opened.
+    scanForRevokedApps(apps).catch(e =>
+      console.error('[BOOT] Revocation scan failed:', e));
+  }
+
+  /**
+   * Launch every app the user has opted into "start at boot" (nova_boot_apps,
+   * set via App Manager's boot toggle — see appmanager.js getBootApps/
+   * setBootApps) AND that separately holds the system:autostart grant.
+   *
+   * Both conditions matter and neither substitutes for the other:
+   *  - nova_boot_apps is the user's own preference ("open this for me"),
+   *    stored per-app, not a security boundary — a malicious app can't get
+   *    itself into this list, only the user's own App Manager toggle does.
+   *  - system:autostart is the permission grant. An app the user asked to
+   *    autostart still needs to actually hold the grant, same as any other
+   *    permission — a boot-list entry is not itself authorization. This
+   *    also protects against nova_boot_apps having been populated by some
+   *    older/different mechanism before this permission existed; a stale
+   *    boot-list entry alone is never enough to launch something.
+   *
+   * Deliberately skipped if the lock screen is showing (OS.lockPin set):
+   * autostart is real, silent app execution with no user present yet to
+   * consent to or even see it happening, which is exactly the case
+   * system:autostart is supposed to be the bigger, explicit ask for — it
+   * shouldn't quietly happen before the user has even unlocked the
+   * session. Apps on the list simply launch once the desktop actually
+   * shows (lockScreen()'s own unlock flow doesn't currently re-trigger
+   * this pass; that's a reasonable follow-up if it becomes an issue, not
+   * something silently assumed to be covered here).
+   */
+  function launchAutostartApps() {
+    if (OS.lockPin) return;
+
+    let bootAppIds;
+    try {
+      bootAppIds = JSON.parse(localStorage.getItem('nova_boot_apps') || '[]');
+    } catch {
+      bootAppIds = [];
+    }
+    if (!Array.isArray(bootAppIds) || bootAppIds.length === 0) return;
+
+    let disabled;
+    try {
+      disabled = JSON.parse(localStorage.getItem('nova_disabled_apps') || '[]')
+        .map(x => (typeof x === 'string' ? x : x?.id))
+        .filter(Boolean);
+    } catch {
+      disabled = [];
+    }
+
+    let staleEntryRemoved = false;
+    for (const appId of bootAppIds) {
+      if (typeof appId !== 'string' || !appId) continue;
+      if (disabled.includes(appId)) continue;
+      if (!OS.apps[appId]) continue; // not installed (or not yet registered)
+
+      const hasGrant = typeof AppPermissionManager !== 'undefined' &&
+        AppPermissionManager.isGranted('system:autostart', appId);
+      if (!hasGrant) {
+        // The grant was revoked (Permissions section) or expired (30-day
+        // unused-app sweep) since this app was added to the boot list.
+        // Don't just skip silently forever — drop the stale entry so App
+        // Manager's toggle reflects reality next time it's opened, instead
+        // of showing "Starts at Boot" for something that will never
+        // actually launch again without the user re-granting it.
+        bootAppIds = bootAppIds.filter(id => id !== appId);
+        staleEntryRemoved = true;
+        continue;
+      }
+
+      try {
+        WM.createWindow(appId);
+        if (typeof EventLog !== 'undefined') {
+          EventLog.log({ app: 'Boot', category: 'apps', severity: 'info', message: `Autostarted ${appId}`, data: { appId } });
+        }
+      } catch (err) {
+        console.warn('[BOOT] Autostart failed for', appId, err);
+      }
+    }
+
+    if (staleEntryRemoved) {
+      try { localStorage.setItem('nova_boot_apps', JSON.stringify(bootAppIds)); } catch { /* quota */ }
+    }
+  }
+
+  /**
+   * Check every installed, signed app against TrustStore.isRevoked and
+   * surface a removal dialog for each one currently on the revocation
+   * list — every boot, not just the first time it's discovered. Shown
+   * sequentially, one at a time, after the desktop is up rather than
+   * blocking boot itself.
+   */
+  async function scanForRevokedApps(apps) {
+    if (typeof TrustStore === 'undefined' || typeof TrustStore.isRevoked !== 'function') return;
+
+    // NOTE: deliberately does NOT filter out a.revoked here. revoked is
+    // persisted permanently once flagged (see markAppRevokedInStorage,
+    // used for the App Manager badge), but the dialog itself must keep
+    // firing every boot regardless of that flag — otherwise clicking
+    // Cancel once (which sets revoked=true) would silently make this a
+    // one-time-only warning, which is exactly the quiet-forever behavior
+    // this feature exists to prevent. The only thing that should stop
+    // the dialog from reappearing is the app actually being removed.
+    const revokedApps = apps.filter(a =>
+      a && a.id && a.signature && TrustStore.isRevoked(a.signature));
+
+    if (revokedApps.length === 0) return;
+
+    // Wait for the desktop/boot animation to settle so the dialog
+    // doesn't fight with boot-screen fade-out/lock-screen transitions.
+    await new Promise(r => setTimeout(r, 1200));
+
+    for (const appData of revokedApps) {
+      // Deliberately sequential (await inside loop) — showing several of
+      // these stacked at once would be confusing; one decision at a time.
+      const revocation = typeof TrustStore.getRevocation === 'function'
+        ? TrustStore.getRevocation(appData.signature)
+        : null;
+      const remove = await showRevokedAppRemovalDialog(appData, revocation);
+      if (remove) {
+        await removeRevokedApp(appData.id);
+      } else {
+        // Persist the revoked flag so the rest of the UI (e.g. App
+        // Manager's package details panel) can reflect it accurately,
+        // WITHOUT suppressing this dialog on future boots — the whole
+        // point is this keeps surfacing until the user acts, the same
+        // way a browser keeps warning about a disabled/malicious
+        // extension rather than mentioning it once and going quiet.
+        markAppRevokedInStorage(appData.id);
+      }
+    }
+  }
+
+  function markAppRevokedInStorage(appId) {
+    try {
+      const list = Storage.get(KEYS.INSTALLED_APPS, []);
+      const idx = list.findIndex(a => a.id === appId);
+      if (idx > -1 && !list[idx].revoked) {
+        list[idx] = { ...list[idx], revoked: true };
+        Storage.set(KEYS.INSTALLED_APPS, list);
+      }
+      if (window.NovaAppPackageStore?.saveRegistry && window.NovaAppPackageStore?.loadRegistry) {
+        const reg = NovaAppPackageStore.loadRegistry();
+        const ri = reg.findIndex(a => a.id === appId);
+        if (ri > -1 && !reg[ri].revoked) {
+          reg[ri] = { ...reg[ri], revoked: true };
+          NovaAppPackageStore.saveRegistry(reg);
+        }
+      }
+    } catch (e) {
+      console.warn('[BOOT] Failed to persist revoked flag for', appId, e);
+    }
+  }
+
+  async function removeRevokedApp(appId) {
+    try {
+      delete OS.apps[appId];
+      const ri = APP_REGISTRY.findIndex(a => a.id === appId);
+      if (ri > -1) APP_REGISTRY.splice(ri, 1);
+      if (typeof AppRegistry !== 'undefined' && AppRegistry.unregisterApp) {
+        AppRegistry.unregisterApp(appId);
+      }
+      if (window.NovaAppPackageStore?.removeApp) {
+        await NovaAppPackageStore.removeApp(appId);
+      } else {
+        const list = Storage.get(KEYS.INSTALLED_APPS, []).filter(a => a.id !== appId);
+        Storage.set(KEYS.INSTALLED_APPS, list);
+      }
+      if (typeof WM !== 'undefined' && WM.updateTaskbar) WM.updateTaskbar();
+      if (typeof renderDesktopIcons === 'function') renderDesktopIcons();
+      console.warn('[BOOT] Removed app with revoked signature:', appId);
+    } catch (e) {
+      console.error('[BOOT] Failed to remove revoked app', appId, e);
+    }
+  }
+
+  /**
+   * Dialog shown when boot discovers an app whose signature has been
+   * revoked SINCE it was installed (as opposed to appmanager.js's
+   * showUntrustedAppDialog, which only ever runs at install time and
+   * offers "Cancel" / "Install Anyway"). This one only ever offers
+   * "Remove" / "Cancel" — there's no "install anyway" equivalent here,
+   * because the app is already installed and running; the only two
+   * outcomes that make sense are taking it out, or acknowledging the
+   * warning and leaving it for now (which will nag again next boot).
+   */
+  function showRevokedAppRemovalDialog(appData, revocation) {
+    return new Promise(resolve => {
+      const escapeHtml = s => String(s ?? '').replace(/[&<>"']/g, c => (
+        { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
+      const overlay = document.createElement('div');
+      overlay.style.cssText = 'position:fixed;inset:0;z-index:99999;display:flex;align-items:center;justify-content:center;font-family:var(--font-ui,sans-serif);';
+
+      const backdrop = document.createElement('div');
+      backdrop.style.cssText = 'position:absolute;inset:0;background:rgba(0,0,0,0.65);backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px);';
+
+      const box = document.createElement('div');
+      box.style.cssText = 'position:relative;background:var(--bg-elevated,#1e1e1e);border:1px solid var(--border,#333);border-radius:14px;max-width:520px;width:94%;max-height:90vh;overflow:hidden;display:flex;flex-direction:column;box-shadow:0 24px 80px rgba(0,0,0,0.5),0 0 0 1px rgba(255,255,255,0.04) inset;';
+
+      const safeName = escapeHtml(appData.name || appData.id || 'This app');
+      const safeId = escapeHtml(appData.id || '');
+      const safeVersion = escapeHtml(appData.version || 'unknown');
+      // NovaByte's own reason for revoking is genuinely useful context for
+      // deciding whether to remove — surface it verbatim when set, rather
+      // than only the generic "why re-checks happen at all" explanation.
+      const safeReason = escapeHtml(revocation?.reason || '');
+      const cautionBorderColor = 'rgba(248,81,73,0.35)';
+      const cautionBgColor = 'rgba(248,81,73,0.1)';
+      const cautionDotColor = '#f85149';
+
+      box.innerHTML = `
+        <div style="padding:20px 24px 16px;border-bottom:1px solid var(--border-subtle,rgba(255,255,255,0.06));display:flex;align-items:flex-start;gap:14px;">
+          <div style="width:44px;height:44px;border-radius:12px;background:var(--bg-inset,rgba(255,255,255,0.04));border:1px solid ${cautionBorderColor};display:flex;align-items:center;justify-content:center;flex-shrink:0;font-size:20px;line-height:1;">\uD83D\uDD34</div>
+          <div style="flex:1;min-width:0;">
+            <div style="font-size:15px;font-weight:700;color:var(--text-primary,#eee);margin-bottom:5px;letter-spacing:-0.01em;">An Installed App Was Revoked</div>
+            <div style="font-size:13px;color:var(--text-secondary,#bbb);line-height:1.55;">
+              <b>${safeName}</b>${safeId ? ` <span style="color:var(--text-muted,#888);">(${safeId})</span>` : ''} was already installed and trusted, but its signature has since been pulled from NovaByte OS's trust list.
+              This is different from an install-time warning — this app has actually been running on your system since it was first installed.
+            </div>
+          </div>
+        </div>
+
+        <div style="padding:16px 24px;display:flex;flex-direction:column;gap:10px;">
+          <div style="display:flex;align-items:flex-start;gap:10px;padding:12px;background:${cautionBgColor};border:1px solid ${cautionBorderColor};border-radius:8px;">
+            <div style="width:6px;height:6px;border-radius:50%;background:${cautionDotColor};flex-shrink:0;margin-top:7px;box-shadow:0 0 6px ${cautionDotColor};"></div>
+            <div style="font-size:12.5px;color:var(--text-secondary,#ccc);line-height:1.55;">
+              <div style="font-weight:600;margin-bottom:4px;font-size:12px;text-transform:uppercase;letter-spacing:0.05em;color:var(--text-muted,#999);">Why this happened</div>
+              A signature is normally only checked when an app is installed. NovaByte OS now also re-checks every installed app's signature each time it starts up, so revocations that happen after install — for example if this package was later found to be harmful, deceptive, or non-compliant — can still be caught.
+            </div>
+          </div>
+
+          <div style="padding:14px;background:var(--bg-inset,rgba(255,255,255,0.03));border:1px solid var(--border-subtle,rgba(255,255,255,0.06));border-radius:8px;">
+            <div style="display:flex;flex-direction:column;gap:7px;font-size:12.5px;color:var(--text-secondary,#bbb);line-height:1.5;">
+              <div style="display:flex;justify-content:space-between;gap:12px;"><span style="color:var(--text-muted,#999);">Package ID</span><span style="font-weight:500;color:var(--text-primary,#eee);text-align:right;word-break:break-all;">${safeId || 'unknown'}</span></div>
+              <div style="display:flex;justify-content:space-between;gap:12px;"><span style="color:var(--text-muted,#999);">Version</span><span style="font-weight:500;color:var(--text-primary,#eee);">${safeVersion}</span></div>
+              <div style="display:flex;justify-content:space-between;gap:12px;"><span style="color:var(--text-muted,#999);">Signature</span><span style="font-weight:500;color:var(--text-primary,#eee);">present, but revoked by NovaByte OS since install</span></div>
+              ${safeReason ? `<div style="display:flex;justify-content:space-between;gap:12px;"><span style="color:var(--text-muted,#999);">Revocation reason</span><span style="font-weight:500;color:var(--text-primary,#eee);text-align:right;">${safeReason}</span></div>` : ''}
+            </div>
+            <div style="margin-top:12px;padding-top:10px;border-top:1px solid var(--border-subtle,rgba(255,255,255,0.06));font-size:12px;color:var(--text-muted,#999);line-height:1.6;">
+              If you keep this app installed, NovaByte OS will show this warning again the next time it starts, until it's removed. Removing it now uninstalls the app and its data folder.
+            </div>
+          </div>
+        </div>
+
+        <div style="padding:12px 24px 16px;border-top:1px solid var(--border-subtle,rgba(255,255,255,0.06));background:var(--bg-sunken,rgba(0,0,0,0.15));display:flex;align-items:center;justify-content:flex-end;gap:8px;">
+          <button id="nb-revoked-cancel-btn" style="background:none;border:1px solid var(--border-subtle,rgba(255,255,255,0.15));color:var(--text-primary,#eee);padding:7px 16px;border-radius:7px;font-size:12.5px;cursor:pointer;transition:all 0.12s;font-weight:500;">Cancel</button>
+          <button id="nb-revoked-remove-btn" style="background:rgba(248,81,73,0.15);border:1px solid rgba(248,81,73,0.4);color:#f85149;padding:7px 16px;border-radius:7px;font-size:12.5px;cursor:pointer;transition:all 0.12s;font-weight:700;">Remove App</button>
+        </div>
+      `;
+
+      const styleEl = document.createElement('style');
+      styleEl.textContent = `
+        #nb-revoked-cancel-btn:hover { background:var(--bg-elevated,#2a2a2a);border-color:var(--border,#555); }
+        #nb-revoked-remove-btn:hover { background:rgba(248,81,73,0.25);border-color:rgba(248,81,73,0.5);box-shadow:0 0 12px rgba(248,81,73,0.15); }
+        #nb-revoked-remove-btn:active, #nb-revoked-cancel-btn:active { transform:scale(0.97); }
+      `;
+      document.head.appendChild(styleEl);
+
+      overlay.appendChild(backdrop);
+      overlay.appendChild(box);
+      document.body.appendChild(overlay);
+
+      const cleanup = () => { overlay.remove(); styleEl.remove(); };
+
+      box.querySelector('#nb-revoked-cancel-btn').addEventListener('click', () => {
+        cleanup();
+        resolve(false);
+      });
+      box.querySelector('#nb-revoked-remove-btn').addEventListener('click', () => {
+        cleanup();
+        resolve(true);
+      });
+      // Deliberately NOT dismissible by clicking the backdrop — this is a
+      // security notice about an app already running on the system, not
+      // a casual install prompt; it should require an explicit choice.
+    });
   }
 
 // ── Global Exports ─────────────────────────────────────────────────

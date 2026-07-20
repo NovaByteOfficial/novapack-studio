@@ -1,269 +1,22 @@
-// ── Search Suggest Proxy ──────────────────────────────────────────────────
-// Direct engine URLs
-// Cache: in-memory Map, 60s TTL, 2000 entry cap.
-// Rate limit: 120 req/min per IP.
-
 const rateLimit = require('express-rate-limit');
+const dns = require('dns');
+const fs = require('fs');
+const path = require('path');
+const ServerEventLog = require('./core/server-event-log');
 
-const suggestCache = new Map(); // key: `${engine}:${q}` → { data, ts }
-const SUGGEST_TTL     = 60 * 1000; // 60 seconds
-const SUGGEST_MAX     = 2000;
-const SUGGEST_TIMEOUT = 5000;
-
-// Direct engine URLs
-const SUGGEST_ENGINES_DIRECT = {
-    google:     q => `https://suggestqueries.google.com/complete/search?client=firefox&q=${encodeURIComponent(q)}`,
-    duckduckgo: q => `https://duckduckgo.com/ac/?q=${encodeURIComponent(q)}&type=list&no-datr=1`,
-    bing:       q => `https://api.bing.com/qsonhs.aspx?q=${encodeURIComponent(q)}`,
-    brave:      q => `https://search.brave.com/api/suggest?q=${encodeURIComponent(q)}`,
-    ecosia:     q => `https://ac.ecosia.org/autocomplete?q=${encodeURIComponent(q)}&type=list`,
-    yahoo:      q => `https://search.yahoo.com/sugg/gossip/gossip-us-ura/?appid=vs&output=json&command=${encodeURIComponent(q)}`,
-};
-
-// Normalise every engine's response format to a plain string[].
-function parseSuggestions(engine, json) {
+// TEMPORARY DEBUG LOGGING — remove once the net:external / proxy issue is
+// diagnosed. ServerEventLog is intentionally in-memory only (see
+// server-event-log.js), so this appends the same detail to a plain file
+// for post-mortem inspection across restarts.
+const DEBUG_LOG_PATH = path.join(__dirname, '..', '..', 'server.log');
+function debugLog(label, details) {
     try {
-        if (engine === 'bing') {
-            return (json?.AS?.Results?.[0]?.Suggests || []).map(s => s.Txt).filter(Boolean).slice(0, 8);
-        }
-        if (engine === 'yahoo') {
-            return (json?.gossip?.results || []).map(s => s.key).filter(Boolean).slice(0, 8);
-        }
-        // google / duckduckgo / brave / ecosia → ["query", ["s1","s2",...]]
-        return (Array.isArray(json?.[1]) ? json[1] : []).filter(Boolean).slice(0, 8);
-    } catch { return []; }
-}
-
-async function fetchDirect(engine, q, signal) {
-    if (!SUGGEST_ENGINES_DIRECT[engine]) throw new Error('Unknown engine');
-    const r = await fetch(SUGGEST_ENGINES_DIRECT[engine](q), {
-        headers: {
-            'User-Agent': 'Mozilla/5.0 (compatible; NovaByte/1.0)',
-            'Accept':     'application/json, */*;q=0.8',
-        },
-        signal,
-    });
-    if (!r.ok) throw new Error(`Direct ${r.status}`);
-    return await r.json();
-}
-
-const suggestLimiter = rateLimit({
-    windowMs: 60 * 1000,
-    max: 120,
-    message: { error: 'Too many suggest requests, slow down.' },
-    standardHeaders: true,
-    legacyHeaders: false,
-});
-
-function setupSuggestProxy(app) {
-    app.get('/api/suggest', suggestLimiter, async (req, res) => {
-        const q      = (req.query.q      || '').trim();
-        const engine = (req.query.engine || 'google').toLowerCase();
-
-        if (!q)                                  return res.status(400).json({ error: 'q parameter is required' });
-        if (q.length > 200)                      return res.status(400).json({ error: 'Query too long' });
-        if (!SUGGEST_ENGINES_DIRECT[engine])     return res.status(400).json({ error: 'Unknown engine' });
-
-        const cacheKey = `${engine}:${q}`;
-        const cached   = suggestCache.get(cacheKey);
-        if (cached && (Date.now() - cached.ts) < SUGGEST_TTL) {
-            res.setHeader('Cache-Control', 'private, max-age=60');
-            return res.json({ suggestions: cached.data });
-        }
-
-        const controller = new AbortController();
-        const timer      = setTimeout(() => controller.abort(), SUGGEST_TIMEOUT);
-
-        let json;
-        let usedFallback = false;
-
-        try {
-            json = await fetchDirect(engine, q, controller.signal);
-        } catch {
-            clearTimeout(timer);
-            usedFallback = true;
-            const fallbackEngines = engine === 'brave' ? ['duckduckgo', 'google'] : ['duckduckgo'];
-            const fallback = fallbackEngines.find(e => SUGGEST_ENGINES_DIRECT[e]);
-            if (!fallback) {
-                return res.status(502).json({ suggestions: [] });
-            }
-            try {
-                json = await fetchDirect(fallback, q, controller.signal);
-            } catch {
-                return res.status(502).json({ suggestions: [] });
-            }
-        }
-
-        clearTimeout(timer);
-
-        const suggestions = parseSuggestions(engine, json);
-
-        // Evict oldest entry if at capacity
-        if (suggestCache.size >= SUGGEST_MAX) {
-            suggestCache.delete(suggestCache.keys().next().value);
-        }
-        suggestCache.set(cacheKey, { data: suggestions, ts: Date.now() });
-
-        res.setHeader('Cache-Control', 'private, max-age=60');
-        res.json({ suggestions });
-    });
-}
-// ── End Search Suggest Proxy ──────────────────────────────────────────────
-
-// ── Email Image Proxy ─────────────────────────────────────────────────────
-// Fetches email images through the local server.
-
-const emailImgCache = new Map(); // key: normalised URL → { buf, mime, ts }
-const EMAIL_IMG_TTL     = 60 * 60 * 1000;  // 1 hour
-const EMAIL_IMG_MAX     = 200;
-const EMAIL_IMG_TIMEOUT = 5000;             // 5 s
-const EMAIL_IMG_SIZE_CAP = 5 * 1024 * 1024; // 5 MB
-
-// 1×1 transparent PNG returned on any failure
-const EMAIL_IMG_DEFAULT = Buffer.from(
-    'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==',
-    'base64'
-);
-
-function isPrivateHostEI(hostname) {
-    const h = hostname.toLowerCase().replace(/^\[|\]$/g, '');
-    const PRIVATE_EXACT   = new Set(['localhost', '127.0.0.1', '::1', '0.0.0.0',
-        '[::1]', '[::]']);
-    const PRIVATE_PREFIXES = ['10.', '172.16.', '172.17.', '172.18.', '172.19.',
-        '172.20.', '172.21.', '172.22.', '172.23.', '172.24.', '172.25.',
-        '172.26.', '172.27.', '172.28.', '172.29.', '172.30.', '172.31.',
-        '192.168.', '169.254.', '100.64.'];
-    if (PRIVATE_EXACT.has(h)) return true;
-    if (PRIVATE_PREFIXES.some(p => h.startsWith(p))) return true;
-    if (h.endsWith('.local') || h.endsWith('.internal')) return true;
-    return false;
-}
-
-function validateEmailImgUrl(raw) {
-    let urlObj;
-    try { urlObj = new URL(raw); } catch (_) { return null; }
-    if (!['http:', 'https:'].includes(urlObj.protocol)) return null;
-    if (urlObj.username || urlObj.password) return null; // credentials in URL = SSRF risk
-    if (isPrivateHostEI(urlObj.hostname)) return null;
-    return urlObj;
-}
-
-async function fetchEmailImage(urlStr) {
-    const CLEAN = {
-        'User-Agent': 'Mozilla/5.0 (compatible; NovaByte/1.0)',
-        'Accept': 'image/png,image/webp,image/jpeg,image/gif,image/*,*/*;q=0.8',
-    };
-
-    let currentUrl = urlStr;
-    const visited = new Set();
-    const MAX_REDIRECTS = 5;
-
-    for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
-        if (visited.has(currentUrl)) return null; // redirect loop
-        visited.add(currentUrl);
-
-        const urlObj = validateEmailImgUrl(currentUrl);
-        if (!urlObj) return null; // SSRF check on every hop
-
-        const controller = new AbortController();
-        const timer = setTimeout(() => controller.abort(), EMAIL_IMG_TIMEOUT);
-
-        let resp;
-        try {
-            resp = await fetch(currentUrl, {
-                headers: CLEAN,
-                redirect: 'manual', // handle redirects manually to re-validate each hop
-                signal: controller.signal,
-            });
-        } catch (_) {
-            return null;
-        } finally {
-            clearTimeout(timer);
-        }
-
-        // Follow redirects manually
-        if (resp.status >= 300 && resp.status < 400) {
-            const loc = resp.headers.get('location');
-            if (!loc) return null;
-            // Resolve relative redirect against current URL
-            try { currentUrl = new URL(loc, currentUrl).toString(); } catch (_) { return null; }
-            continue;
-        }
-
-        if (!resp.ok) return null;
-
-        // Content-type must be an image
-        const contentType = (resp.headers.get('content-type') || '').split(';')[0].trim().toLowerCase();
-        if (!contentType.startsWith('image/')) return null;
-
-        // Read with size cap
-        const reader = resp.body.getReader();
-        const chunks = [];
-        let total = 0;
-        while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            total += value.length;
-            if (total > EMAIL_IMG_SIZE_CAP) { reader.cancel(); return null; }
-            chunks.push(value);
-        }
-
-        const buf = Buffer.concat(chunks.map(c => Buffer.from(c)));
-        if (buf.length < 1) return null;
-
-        return { buf, mime: contentType };
+        const line = `[${new Date().toISOString()}] ${label} ${JSON.stringify(details)}\n`;
+        fs.appendFileSync(DEBUG_LOG_PATH, line);
+    } catch (e) {
+        // best-effort only — never let debug logging break the request
     }
-
-    return null; // too many redirects
 }
-
-const emailImgLimiter = rateLimit({
-    windowMs: 60 * 1000,
-    max: 500,  // single HTML email can have 50+ images; allow rapid inbox browsing
-    message: { error: 'Too many image requests, slow down.' },
-    standardHeaders: true,
-    legacyHeaders: false,
-});
-
-function setupEmailImageProxy(app) {
-    app.get('/api/email-image', emailImgLimiter, async (req, res) => {
-        const raw = req.query.url;
-        if (!raw || typeof raw !== 'string') {
-            return res.status(400).json({ error: 'url parameter is required' });
-        }
-
-        const urlObj = validateEmailImgUrl(raw);
-        if (!urlObj) {
-            // Return placeholder silently — don't reveal why to client
-            res.setHeader('Content-Type', 'image/png');
-            res.setHeader('Cache-Control', 'public, max-age=3600');
-            return res.send(EMAIL_IMG_DEFAULT);
-        }
-
-        const cacheKey = urlObj.toString();
-        const cached = emailImgCache.get(cacheKey);
-        if (cached && (Date.now() - cached.ts) < EMAIL_IMG_TTL) {
-            res.setHeader('Content-Type', cached.mime);
-            res.setHeader('Cache-Control', 'public, max-age=3600');
-            return res.send(cached.buf);
-        }
-
-        const result = await fetchEmailImage(raw);
-        const buf  = result ? result.buf  : EMAIL_IMG_DEFAULT;
-        const mime = result ? result.mime : 'image/png';
-
-        // Evict oldest if at capacity
-        if (emailImgCache.size >= EMAIL_IMG_MAX) {
-            emailImgCache.delete(emailImgCache.keys().next().value);
-        }
-        emailImgCache.set(cacheKey, { buf, mime, ts: Date.now() });
-
-        res.setHeader('Content-Type', mime);
-        res.setHeader('Cache-Control', 'public, max-age=3600');
-        res.send(buf);
-    });
-}
-// ── End Email Image Proxy ──────────────────────────────────────────────────
 
 // ── Frame-Embed Check Proxy ────────────────────────────────────────────────
 // Resolves whether a URL can be embedded in an <iframe> by inspecting the
@@ -277,19 +30,6 @@ const frameCheckCache = new Map(); // key: origin → { embeddable, ts }
 const FRAME_CHECK_TTL     = 10 * 60 * 1000; // 10 min — XFO/CSP headers rarely change
 const FRAME_CHECK_MAX     = 500;
 const FRAME_CHECK_TIMEOUT = 5000;
-
-function _isPrivateFrameHost(hostname) {
-    const h = hostname.toLowerCase().replace(/^\[|\]$/g, '');
-    const PRIVATE_EXACT = new Set(['localhost', '127.0.0.1', '::1', '0.0.0.0', '[::1]', '[::]']);
-    const PRIVATE_PREFIXES = ['10.', '172.16.', '172.17.', '172.18.', '172.19.',
-        '172.20.', '172.21.', '172.22.', '172.23.', '172.24.', '172.25.',
-        '172.26.', '172.27.', '172.28.', '172.29.', '172.30.', '172.31.',
-        '192.168.', '169.254.', '100.64.'];
-    if (PRIVATE_EXACT.has(h)) return true;
-    if (PRIVATE_PREFIXES.some(p => h.startsWith(p))) return true;
-    if (h.endsWith('.local') || h.endsWith('.internal')) return true;
-    return false;
-}
 
 /**
  * Evaluate a frame-ancestors source list against our embedding origin.
@@ -360,28 +100,58 @@ const frameCheckLimiter = rateLimit({
     legacyHeaders: false,
 });
 
+// Fetches targetUrl with manual, per-hop SSRF revalidation + IP pinning
+// (redirect: 'follow' would let fetch chase a redirect straight to a
+// private/internal address with no revalidation at all — the classic
+// SSRF-via-redirect bypass, and worse than the rebinding gap since it
+// needs no timing trick, just a 302).
+const FRAME_CHECK_MAX_REDIRECTS = 5;
+async function _probeFetchValidated(initialUrl, method, signal) {
+    let currentUrl = initialUrl;
+    const visited = new Set();
+    for (let hop = 0; hop <= FRAME_CHECK_MAX_REDIRECTS; hop++) {
+        if (visited.has(currentUrl)) throw Object.assign(new Error('Redirect loop'), { code: 'REDIRECT_LOOP' });
+        visited.add(currentUrl);
+
+        let urlObj;
+        try { urlObj = new URL(currentUrl); } catch { throw Object.assign(new Error('Invalid URL'), { code: 'INVALID_URL' }); }
+        if (!['http:', 'https:'].includes(urlObj.protocol)) throw Object.assign(new Error('Bad protocol'), { code: 'BAD_PROTOCOL' });
+        if (_isPrivateHost(urlObj.hostname)) throw Object.assign(new Error('Private host'), { code: 'SSRF_BLOCKED' });
+        const dnsResult = await _dnsResolvePrivate(urlObj.hostname);
+        if (dnsResult.private) throw Object.assign(new Error('Private host (DNS)'), { code: 'SSRF_BLOCKED' });
+
+        const resp = await _pinnedFetch(currentUrl, {
+            method,
+            headers: { 'User-Agent': 'Mozilla/5.0 (compatible; NovaByte/1.0)' },
+            redirect: 'manual',
+            signal,
+        }, dnsResult);
+
+        if (resp.status >= 300 && resp.status < 400) {
+            const loc = resp.headers.get('location');
+            try { resp.body?.cancel(); } catch (_) {}
+            if (!loc) throw Object.assign(new Error('Redirect with no Location'), { code: 'BAD_REDIRECT' });
+            try { currentUrl = new URL(loc, currentUrl).toString(); }
+            catch { throw Object.assign(new Error('Invalid redirect target'), { code: 'BAD_REDIRECT' }); }
+            continue;
+        }
+        return resp;
+    }
+    throw Object.assign(new Error('Too many redirects'), { code: 'TOO_MANY_REDIRECTS' });
+}
+
 async function _probeFrameEmbeddable(targetUrl, embedOrigin) {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), FRAME_CHECK_TIMEOUT);
     try {
         // HEAD first — cheapest; many servers echo the same security headers.
-        let resp = await fetch(targetUrl, {
-            method: 'HEAD',
-            redirect: 'follow',
-            headers: { 'User-Agent': 'Mozilla/5.0 (compatible; NovaByte/1.0)' },
-            signal: controller.signal,
-        });
+        let resp = await _probeFetchValidated(targetUrl, 'HEAD', controller.signal);
         // Some servers don't send XFO/CSP on HEAD (or reject it). Fall back to GET.
         const hasSecurityHdr = resp.headers.get('x-frame-options') ||
             /frame-ancestors/i.test(resp.headers.get('content-security-policy') || '');
         if (!hasSecurityHdr && resp.ok) return false;
         if (resp.status === 405 || resp.status === 501 || resp.status === 400 || !resp.ok) {
-            resp = await fetch(targetUrl, {
-                method: 'GET',
-                redirect: 'follow',
-                headers: { 'User-Agent': 'Mozilla/5.0 (compatible; NovaByte/1.0)' },
-                signal: controller.signal,
-            });
+            resp = await _probeFetchValidated(targetUrl, 'GET', controller.signal);
             // Stream bodies are expensive; we only need headers, so cancel it.
             try { resp.body?.cancel(); } catch (_) {}
         }
@@ -392,7 +162,7 @@ async function _probeFrameEmbeddable(targetUrl, embedOrigin) {
 }
 
 function setupFrameCheckProxy(app) {
-    app.get('/api/frame-check', frameCheckLimiter, async (req, res) => {
+    app.get('/api/frame-check', frameCheckLimiter, requireSession, async (req, res) => {
         const raw = req.query.url;
         if (!raw || typeof raw !== 'string') {
             return res.status(400).json({ error: 'url parameter is required' });
@@ -405,7 +175,9 @@ function setupFrameCheckProxy(app) {
         if (!['http:', 'https:'].includes(urlObj.protocol)) {
             return res.status(400).json({ error: 'Only http and https URLs are supported' });
         }
-        if (_isPrivateFrameHost(urlObj.hostname)) {
+
+        const isPrivate = await _dnsCheckPrivate(urlObj.hostname);
+        if (isPrivate) {
             return res.status(400).json({ error: 'Internal URLs are not permitted' });
         }
 
@@ -434,8 +206,480 @@ function setupFrameCheckProxy(app) {
 }
 // ── End Frame-Embed Check Proxy ────────────────────────────────────────────
 
+// ── App Network Proxy ──────────────────────────────────────────────────────
+// Used by app-sandbox.js handleNetFetch to make outbound requests server-side,
+// bypassing browser CORS restrictions for apps with the net:external permission.
+//
+// Security model:
+//   - Only reachable from the same origin (enforced by the sandbox's IPC flow;
+//     the sandbox calls /api/proxy, not the iframe directly).
+//   - Private/internal IPs blocked (SSRF prevention).
+//   - Allowlisted HTTP methods only.
+//   - Response size capped to prevent memory exhaustion.
+//   - Rate limited per IP.
+
+const APP_PROXY_TIMEOUT    = 30 * 1000;      // 30 s — match IPC timeout
+const APP_PROXY_SIZE_CAP   = 10 * 1024 * 1024; // 10 MB
+const APP_PROXY_METHODS    = new Set(['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS']);
+
+function requireSession(req, res, next) {
+    if (!req.session || !req.session.id) {
+        return res.status(401).json({ error: 'Unauthorized — session required' });
+    }
+    next();
+}
+
+const _PRIVATE_EXACT = new Set(['localhost', '127.0.0.1', '::1', '0.0.0.0', '[::1]', '[::]']);
+const _PRIVATE_PREFIXES = ['10.', '172.16.', '172.17.', '172.18.', '172.19.',
+    '172.20.', '172.21.', '172.22.', '172.23.', '172.24.', '172.25.',
+    '172.26.', '172.27.', '172.28.', '172.29.', '172.30.', '172.31.',
+    '192.168.', '169.254.', '100.64.', '127.'];
+
+function _isPrivateHost(hostname) {
+    const h = hostname.toLowerCase().replace(/^\[|\]$/g, '');
+    if (_PRIVATE_EXACT.has(h)) return true;
+    if (_PRIVATE_PREFIXES.some(p => h.startsWith(p))) return true;
+    if (h.endsWith('.local') || h.endsWith('.internal')) return true;
+    return false;
+}
+
+// IPv4-mapped IPv6 (::ffff:a.b.c.d) — pull out the embedded v4 address so it
+// hits the same range checks as a plain v4 literal.
+function _extractMappedV4(ip) {
+    const m = /^::ffff:(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/i.exec(ip);
+    return m ? m[1] : null;
+}
+
+function _isPrivateIpv4(ip) {
+    if (!/^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(ip)) return false;
+    const parts = ip.split('.').map(Number);
+    if (parts.some(p => p > 255)) return false;
+    return parts[0] === 10 ||
+           parts[0] === 127 ||                                    // loopback 127.0.0.0/8
+           parts[0] === 0 ||                                      // "this network" 0.0.0.0/8
+           (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31) ||
+           (parts[0] === 192 && parts[1] === 168) ||
+           (parts[0] === 169 && parts[1] === 254) ||               // link-local incl. cloud metadata
+           (parts[0] === 100 && parts[1] >= 64 && parts[1] <= 127); // CGNAT
+}
+
+function _isPrivateIpv6(ip) {
+    const h = ip.toLowerCase().replace(/^\[|\]$/g, '');
+    if (h === '::1' || h === '::') return true;                   // loopback / unspecified
+    const mapped = _extractMappedV4(h);
+    if (mapped) return _isPrivateIpv4(mapped);
+    if (/^f[cd][0-9a-f]{2}:/.test(h)) return true;                 // ULA fc00::/7
+    if (/^fe[89ab][0-9a-f]:/.test(h)) return true;                 // link-local fe80::/10
+    return false;
+}
+
+function _isPrivateIpAddr(ip) {
+    if (!ip || typeof ip !== 'string') return true; // fail closed
+    if (ip.includes(':')) return _isPrivateIpv6(ip);
+    return _isPrivateIpv4(ip);
+}
+
+const _dnsPrivateCache = new Map();
+const _DNS_TTL = 30_000;
+
+// Resolves hostname -> { private, address, family } and caches the result.
+// address/family are needed downstream so the actual network connection can
+// be pinned to the exact IP we validated (see _pinnedFetch), instead of
+// letting fetch() re-resolve the hostname itself. Re-resolving is what opens
+// the DNS-rebinding TOCTOU gap: validation lookup returns a public IP, then
+// the fetch's own lookup (attacker-controlled DNS, low TTL) returns a
+// private one moments later.
+async function _dnsResolvePrivate(hostname) {
+    if (!hostname || typeof hostname !== 'string') return { private: true, address: null, family: null };
+    const h = hostname.toLowerCase().replace(/^\[|\]$/g, '');
+    if (_isPrivateHost(h)) return { private: true, address: null, family: null };
+
+    const cached = _dnsPrivateCache.get(h);
+    if (cached && Date.now() - cached.ts < _DNS_TTL) return cached;
+
+    let result;
+    try {
+        const { address, family } = await dns.promises.lookup(h);
+        result = { private: _isPrivateIpAddr(address), address, family, ts: Date.now() };
+    } catch {
+        result = { private: true, address: null, family: null, ts: Date.now() }; // fail closed on DNS error
+    }
+
+    _dnsPrivateCache.set(h, result);
+    if (_dnsPrivateCache.size > 500) {
+        const first = _dnsPrivateCache.keys().next().value;
+        _dnsPrivateCache.delete(first);
+    }
+    return result;
+}
+
+// Backward-compatible boolean-only wrapper. IMPORTANT: any caller that goes
+// on to fetch() the same hostname itself is still exposed to the rebinding
+// TOCTOU. Use _dnsResolvePrivate + _pinnedFetch for anything that performs
+// a real outbound request; this wrapper is for checks that don't fetch.
+async function _dnsCheckPrivate(hostname) {
+    const { private: isPrivate } = await _dnsResolvePrivate(hostname);
+    return isPrivate;
+}
+
+// Fetch pinned to a pre-validated IP, closing the DNS-rebinding TOCTOU: we
+// resolve+validate once via _dnsResolvePrivate, then force the TCP
+// connection to that exact IP. Host header / TLS SNI still use the original
+// hostname (undici handles this automatically — we only override the
+// connect-time lookup, not the URL). If dnsResult indicates an
+// invalid/private/unresolved address, this throws rather than silently
+// falling back to fetch's own resolver.
+const { Agent, fetch: undiciFetch } = require('undici');
+function _pinnedAgent(pinnedAddress, family) {
+    return new Agent({
+        connect: {
+            lookup: (_hostname, _opts, cb) => {
+                cb(null, [{ address: pinnedAddress, family: family === 6 ? 6 : 4 }]);
+            },
+        },
+    });
+}
+async function _pinnedFetch(urlString, opts, dnsResult) {
+    if (!dnsResult || dnsResult.private || !dnsResult.address) {
+        throw Object.assign(new Error('Refusing to fetch unvalidated/private address'), { code: 'SSRF_BLOCKED' });
+    }
+    const agent = _pinnedAgent(dnsResult.address, dnsResult.family);
+    try {
+        return await undiciFetch(urlString, { ...opts, dispatcher: agent });
+    } finally {
+        agent.close().catch(() => {});
+    }
+}
+
+const appProxyLimiter = rateLimit({
+    windowMs: 60 * 1000,
+    max: 300,  // generous — chat apps can send many messages per minute
+    message: { error: 'Too many proxy requests, slow down.' },
+    standardHeaders: true,
+    legacyHeaders: false,
+});
+
+function setupAppNetworkProxy(app) {
+    app.post('/api/proxy', appProxyLimiter, requireSession, async (req, res) => {
+        const { url: rawUrl, method: rawMethod, headers: reqHeaders, body: reqBody } = req.body ?? {};
+        debugLog('PROXY_REQUEST_IN', { rawUrl, rawMethod });
+
+        // Validate URL
+        if (!rawUrl || typeof rawUrl !== 'string') {
+            debugLog('PROXY_REJECT_NO_URL', { rawUrl });
+            return res.status(400).json({ error: 'url is required' });
+        }
+        let urlObj;
+        try { urlObj = new URL(rawUrl); }
+        catch (_) {
+            debugLog('PROXY_REJECT_INVALID_URL', { rawUrl });
+            return res.status(400).json({ error: 'Invalid URL' });
+        }
+
+        if (!['http:', 'https:'].includes(urlObj.protocol)) {
+            debugLog('PROXY_REJECT_PROTOCOL', { rawUrl, protocol: urlObj.protocol });
+            return res.status(400).json({ error: 'Only http and https URLs are supported' });
+        }
+        if (_isPrivateHost(urlObj.hostname)) {
+            debugLog('PROXY_REJECT_PRIVATE_HOST', { hostname: urlObj.hostname });
+            ServerEventLog.log({
+                app: 'AppNetworkProxy',
+                severity: 'warn',
+                message: `Blocked proxy request to private host: ${urlObj.hostname}`,
+                data: { hostname: urlObj.hostname, reason: 'private_host' },
+            });
+            return res.status(403).json({ error: 'Internal URLs are not permitted' });
+        }
+        // dnsResult carries the resolved IP forward so the eventual fetch can be
+        // pinned to it (see loop below) instead of re-resolving the hostname.
+        let dnsResult = await _dnsResolvePrivate(urlObj.hostname);
+        if (dnsResult.private) {
+            debugLog('PROXY_REJECT_DNS_PRIVATE', { hostname: urlObj.hostname });
+            ServerEventLog.log({
+                app: 'AppNetworkProxy',
+                severity: 'warn',
+                message: `Blocked proxy request to private host (DNS-resolved): ${urlObj.hostname}`,
+                data: { hostname: urlObj.hostname, reason: 'dns_private' },
+            });
+            return res.status(403).json({ error: 'Internal URLs are not permitted' });
+        }
+
+        // Validate method
+        const method = (rawMethod || 'GET').toUpperCase();
+        if (!APP_PROXY_METHODS.has(method)) {
+            return res.status(400).json({ error: `Method not allowed: ${method}` });
+        }
+
+        // Strip hop-by-hop headers that must not be forwarded
+        const HOP_BY_HOP = new Set([
+            'host', 'connection', 'keep-alive', 'proxy-authenticate',
+            'proxy-authorization', 'te', 'trailers', 'transfer-encoding', 'upgrade',
+        ]);
+        const outHeaders = {};
+        if (reqHeaders && typeof reqHeaders === 'object') {
+            for (const [k, v] of Object.entries(reqHeaders)) {
+                if (!HOP_BY_HOP.has(k.toLowerCase())) {
+                    outHeaders[k] = v;
+                }
+            }
+        }
+
+        // Follow redirects manually so each hop gets re-validated against the
+        // private-host check (mirrors the pattern used by fetchEmailImage above).
+        // Without this, a public URL that 302s to an internal/metadata address
+        // would sail through the initial check and still reach it via fetch's
+        // own automatic redirect handling.
+        const MAX_PROXY_REDIRECTS = 5;
+        let currentUrl = urlObj.toString();
+        const visitedUrls = new Set();
+        let resp;
+
+        for (let hop = 0; hop <= MAX_PROXY_REDIRECTS; hop++) {
+            if (visitedUrls.has(currentUrl)) {
+                ServerEventLog.log({
+                    app: 'AppNetworkProxy',
+                    severity: 'warn',
+                    message: `Redirect loop detected proxying ${urlObj.hostname}`,
+                    data: { hostname: urlObj.hostname },
+                });
+                return res.status(400).json({ error: 'Redirect loop detected' });
+            }
+            visitedUrls.add(currentUrl);
+
+            let hopUrlObj;
+            try { hopUrlObj = new URL(currentUrl); }
+            catch (_) { return res.status(400).json({ error: 'Invalid redirect URL' }); }
+
+            if (!['http:', 'https:'].includes(hopUrlObj.protocol)) {
+                return res.status(400).json({ error: 'Only http and https URLs are supported' });
+            }
+            if (_isPrivateHost(hopUrlObj.hostname)) {
+                return res.status(403).json({ error: 'Internal URLs are not permitted' });
+            }
+            // Re-resolve + re-validate on every hop (redirect targets can point
+            // anywhere) and keep the resolved IP so the fetch below is pinned to
+            // exactly what we just validated.
+            dnsResult = await _dnsResolvePrivate(hopUrlObj.hostname);
+            if (dnsResult.private) {
+                return res.status(403).json({ error: 'Internal URLs are not permitted' });
+            }
+
+            const controller = new AbortController();
+            const timer = setTimeout(() => controller.abort(), APP_PROXY_TIMEOUT);
+
+            let hopResp;
+            try {
+                hopResp = await _pinnedFetch(currentUrl, {
+                    method,
+                    headers: outHeaders,
+                    body: (method === 'GET' || method === 'HEAD') ? undefined : (reqBody ?? null),
+                    redirect: 'manual',
+                    signal: controller.signal,
+                }, dnsResult);
+            } catch (err) {
+                clearTimeout(timer);
+                debugLog('PROXY_FETCH_THREW', {
+                    hostname: urlObj.hostname,
+                    currentUrl,
+                    message: err.message,
+                    code: err.code || (err.cause && err.cause.code) || null,
+                    causeMessage: err.cause && err.cause.message,
+                    stack: err.stack,
+                });
+                ServerEventLog.log({
+                    app: 'AppNetworkProxy',
+                    severity: 'error',
+                    message: `Network error proxying ${urlObj.hostname}: ${err.message}`,
+                    data: { hostname: urlObj.hostname, error: err.message },
+                });
+                return res.status(502).json({ error: `Network error: ${err.message}` });
+            } finally {
+                clearTimeout(timer);
+            }
+
+            if (hopResp.status >= 300 && hopResp.status < 400) {
+                const loc = hopResp.headers.get('location');
+                if (!loc) return res.status(502).json({ error: 'Redirect with no Location header' });
+                try { currentUrl = new URL(loc, currentUrl).toString(); }
+                catch (_) { return res.status(400).json({ error: 'Invalid redirect target' }); }
+                continue;
+            }
+
+            resp = hopResp;
+            break;
+        }
+
+        if (!resp) {
+            debugLog('PROXY_TOO_MANY_REDIRECTS', { hostname: urlObj.hostname });
+            return res.status(502).json({ error: 'Too many redirects' });
+        }
+        debugLog('PROXY_FETCH_OK', { hostname: urlObj.hostname, status: resp.status });
+
+        // Read response body with size cap
+        const chunks = [];
+        let total = 0;
+        try {
+            const reader = resp.body.getReader();
+            while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                total += value.length;
+                if (total > APP_PROXY_SIZE_CAP) {
+                    reader.cancel();
+                    return res.status(502).json({ error: 'Response too large' });
+                }
+                chunks.push(value);
+            }
+        } catch (err) {
+            return res.status(502).json({ error: `Read error: ${err.message}` });
+        }
+
+        const bodyText = Buffer.concat(chunks.map(c => Buffer.from(c))).toString('utf8');
+
+        // Forward a safe subset of response headers
+        const SAFE_RESPONSE_HEADERS = new Set([
+            'content-type', 'content-language', 'cache-control',
+            'etag', 'last-modified', 'x-request-id',
+        ]);
+        const outRespHeaders = {};
+        for (const [k, v] of resp.headers.entries()) {
+            if (SAFE_RESPONSE_HEADERS.has(k.toLowerCase())) {
+                outRespHeaders[k] = v;
+            }
+        }
+
+        res.json({
+            status:     resp.status,
+            statusText: resp.statusText,
+            headers:    outRespHeaders,
+            body:       bodyText,
+        });
+    });
+}
+// ── End App Network Proxy ──────────────────────────────────────────────────
+
+// ── Email Image Proxy (security-only) ───────────────────────────────────────
+// Fetches a single email-embedded image server-side so the renderer never
+// issues the request directly. This exists ONLY to prevent SSRF via
+// attacker-controlled <img src> URLs in email HTML — it does NOT cache
+// responses or attempt to defeat sender tracking pixels. Every hop (initial
+// URL and any redirect target) is re-validated with the same
+// _isPrivateHost / _dnsCheckPrivate checks used by the other proxies above.
+
+const EMAIL_IMG_TIMEOUT  = 5000;
+const EMAIL_IMG_SIZE_CAP = 5 * 1024 * 1024; // 5 MB
+const EMAIL_IMG_MAX_REDIRECTS = 5;
+
+async function _validateEmailImgHop(rawUrl) {
+    let urlObj;
+    try { urlObj = new URL(rawUrl); } catch { return null; }
+    if (!['http:', 'https:'].includes(urlObj.protocol)) return null;
+    if (urlObj.username || urlObj.password) return null;
+    if (_isPrivateHost(urlObj.hostname)) return null;
+    const dnsResult = await _dnsResolvePrivate(urlObj.hostname);
+    if (dnsResult.private) return null;
+    return { urlObj, dnsResult };
+}
+
+async function _fetchEmailImage(initialUrl) {
+    let currentUrl = initialUrl;
+    const visited = new Set();
+
+    for (let hop = 0; hop <= EMAIL_IMG_MAX_REDIRECTS; hop++) {
+        if (visited.has(currentUrl)) return null; // redirect loop
+        visited.add(currentUrl);
+
+        // Re-validate on every hop — a URL can pass the check, then redirect
+        // to a private/internal address (classic SSRF-via-redirect bypass).
+        const validated = await _validateEmailImgHop(currentUrl);
+        if (!validated) return null;
+        const { dnsResult } = validated;
+
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), EMAIL_IMG_TIMEOUT);
+
+        let resp;
+        try {
+            // Pinned to the IP we just validated — fetch() re-resolving the
+            // hostname itself is the DNS-rebinding gap this closes.
+            resp = await _pinnedFetch(currentUrl, {
+                headers: { 'User-Agent': 'Mozilla/5.0 (compatible; NovaByte/1.0)' },
+                redirect: 'manual', // never let fetch auto-follow — we must validate each hop ourselves
+                signal: controller.signal,
+            }, dnsResult);
+        } catch {
+            return null;
+        } finally {
+            clearTimeout(timer);
+        }
+
+        if (resp.status >= 300 && resp.status < 400) {
+            const loc = resp.headers.get('location');
+            if (!loc) return null;
+            try { currentUrl = new URL(loc, currentUrl).toString(); } catch { return null; }
+            continue;
+        }
+
+        if (!resp.ok) return null;
+
+        const contentType = (resp.headers.get('content-type') || '').split(';')[0].trim().toLowerCase();
+        if (!contentType.startsWith('image/')) return null;
+
+        const reader = resp.body.getReader();
+        const chunks = [];
+        let total = 0;
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            total += value.length;
+            if (total > EMAIL_IMG_SIZE_CAP) { reader.cancel(); return null; }
+            chunks.push(value);
+        }
+
+        const buf = Buffer.concat(chunks.map(c => Buffer.from(c)));
+        if (buf.length < 1) return null;
+        return { buf, mime: contentType };
+    }
+
+    return null; // too many redirects
+}
+
+const emailImgLimiter = rateLimit({
+    windowMs: 60 * 1000,
+    max: 500, // a single HTML email can have 50+ images; allow rapid inbox browsing
+    message: { error: 'Too many image requests, slow down.' },
+    standardHeaders: true,
+    legacyHeaders: false,
+});
+
+// 1×1 transparent PNG returned on any validation/fetch failure — never leak
+// *why* a fetch failed (avoids confirming internal-network topology to a
+// sender probing which addresses are reachable).
+const EMAIL_IMG_FALLBACK = Buffer.from(
+    'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==',
+    'base64'
+);
+
+function setupEmailImageProxy(app) {
+    app.get('/api/email-image', emailImgLimiter, requireSession, async (req, res) => {
+        const raw = req.query.url;
+        if (!raw || typeof raw !== 'string') {
+            return res.status(400).json({ error: 'url parameter is required' });
+        }
+
+        const result = await _fetchEmailImage(raw);
+        const buf  = result ? result.buf  : EMAIL_IMG_FALLBACK;
+        const mime = result ? result.mime : 'image/png';
+
+        res.setHeader('Content-Type', mime);
+        res.setHeader('Cache-Control', 'no-store'); // no caching layer — security-only proxy
+        res.send(buf);
+    });
+}
+// ── End Email Image Proxy ───────────────────────────────────────────────────
+
 module.exports = {
-    setupSuggestProxy,
-    setupEmailImageProxy,
     setupFrameCheckProxy,
+    setupAppNetworkProxy,
+    setupEmailImageProxy,
 };

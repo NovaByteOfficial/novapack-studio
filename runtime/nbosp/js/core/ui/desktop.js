@@ -575,10 +575,38 @@ const AppDirs = {
     'nbosp-contacts': 'com.nbosp.contacts',
     'nbosp-search': 'com.nbosp.search',
     'nbosp-music': 'com.nbosp.music',
+    'devconsole': 'com.nbosp.devconsole',
+    'events': 'com.nbosp.events',
+    'permissions': 'com.nbosp.permissions',
   },
 
   // Resolved directory handles cache — avoids repeated getDirectoryHandle calls
   _handles: {},
+
+  // Reverse map: full package id → short app id
+  _PKG_TO_APP: null,
+  _getPkgToApp() {
+    if (!this._PKG_TO_APP) {
+      this._PKG_TO_APP = {};
+      for (const [k, v] of Object.entries(this.PACKAGES)) {
+        this._PKG_TO_APP[v] = k;
+      }
+    }
+    return this._PKG_TO_APP;
+  },
+  _resolveAppId(pkg) {
+    const m = this._getPkgToApp();
+    return m[pkg] || pkg;
+  },
+  _getCallerAppId() {
+    try {
+      const winId = OS?.focusedWindowId;
+      if (!winId || !OS?.windows) return null;
+      return OS.windows.get(winId)?.appId ?? null;
+    } catch {
+      return null;
+    }
+  },
 
   // Bootstrap the full directory tree — safe to call every boot (idempotent)
   async bootstrap() {
@@ -685,6 +713,9 @@ const AppDirs = {
       'com.nbosp.contacts':    { name: 'Contacts',    version: '1.0.0', description: 'Contacts' },
       'com.nbosp.search':      { name: 'Search',      version: '1.0.0', description: 'System Search' },
       'com.nbosp.music':       { name: 'Music',       version: '1.0.0', description: 'Music Player' },
+      'com.nbosp.devconsole':  { name: 'Console',     version: '1.0.0', description: 'Developer Console' },
+      'com.nbosp.events':      { name: 'Events',      version: '1.0.0', description: 'Event Log' },
+      'com.nbosp.permissions': { name: 'Permissions', version: '1.0.0', description: 'App Permissions' },
     };
 
     try {
@@ -750,8 +781,78 @@ const AppDirs = {
     }
   },
 
+  async _ensureDataNode() {
+    const dataNode = FS.getByPath('/data');
+    if (dataNode && dataNode.type === 'folder') return dataNode.id;
+    const created = await FS.createFolder(FS.rootId, 'data');
+    return created ? created.id : null;
+  },
+
+  async _ensureVFSChild(parentId, name, type) {
+    const existing = FS.listDir(parentId).find(f => f.name === name && f.type === type);
+    if (existing) return existing;
+    if (type === 'folder') return await FS.createFolder(parentId, name);
+    return await FS.createFile(parentId, name, '', 'application/json');
+  },
+
+  async ensureAppDataFolder(appIdOrPkg) {
+    const pkg = this.PACKAGES[appIdOrPkg] || appIdOrPkg;
+    if (this._handles[pkg]) return this._handles[pkg];
+
+    if (OPFS.available && OPFS.root) {
+      try {
+        const data = await OPFS.root.getDirectoryHandle('data', { create: true });
+        const appDir = await data.getDirectoryHandle(pkg, { create: true });
+        const mkd = async (p, n) => { try { await p.getDirectoryHandle(n, { create: true }); } catch {} };
+        await mkd(appDir, 'files');
+        await mkd(appDir, 'cache');
+        await mkd(appDir, 'databases');
+        await mkd(appDir, 'shared_prefs');
+        this._handles[pkg] = appDir;
+      } catch (e) {
+        console.warn('[AppDirs] OPFS ensure failed for', pkg, e);
+      }
+    }
+
+    try {
+      const dataNodeId = FS.specialFolders?.data || (await this._ensureDataNode());
+      const appNode = await this._ensureVFSChild(dataNodeId, pkg, 'folder');
+      const filesNode = await this._ensureVFSChild(appNode.id, 'files', 'folder');
+      const cacheNode = await this._ensureVFSChild(appNode.id, 'cache', 'folder');
+      const dbNode = await this._ensureVFSChild(appNode.id, 'databases', 'folder');
+      const prefsNode = await this._ensureVFSChild(appNode.id, 'shared_prefs', 'folder');
+      if (!this.vfsFolders) this.vfsFolders = {};
+      this.vfsFolders[pkg] = {
+        root: appNode.id,
+        files: filesNode?.id,
+        cache: cacheNode?.id,
+        databases: dbNode?.id,
+        shared_prefs: prefsNode?.id,
+      };
+    } catch (e) {
+      console.warn('[AppDirs] VFS ensure failed for', pkg, e);
+    }
+
+    return this._handles[pkg] || null;
+  },
+
   async getAppDir(appIdOrPkg) {
     const pkg = this.PACKAGES[appIdOrPkg] || appIdOrPkg;
+
+    // Runtime guard: deny requests for another app's directory unless the caller
+    // has system:apps permission. System calls (no focused window) pass through.
+    const callerAppId = this._getCallerAppId();
+    if (callerAppId) {
+      const targetAppId = this._resolveAppId(pkg);
+      if (targetAppId && targetAppId !== callerAppId) {
+        const mgr = typeof AppPermissionManager !== 'undefined' ? AppPermissionManager : null;
+        if (!mgr?.isGranted?.('system:apps', callerAppId)) {
+          console.warn('[AppDirs] Access denied — caller', callerAppId, 'tried to access app dir for', pkg);
+          return null;
+        }
+      }
+    }
+
     if (this._handles[pkg]) return this._handles[pkg];
     if (!OPFS.available || !OPFS.root) return null;
     try {
@@ -792,6 +893,41 @@ const AppDirs = {
     }
   },
 
+  // Single source of truth for uninstall-time app data cleanup — deletes
+  // the app's /data/<appId> VFS folder (resolved via FS.getByPath, since
+  // FS.specialFolders never has a 'data' entry — only desktop/documents/
+  // downloads/music/pictures/videos/trash are registered there) plus the
+  // OPFS-backed folder and any cached handles. All uninstall call sites
+  // (App Manager, desktop right-click x2, Launchpad, My Apps panel)
+  // should call this instead of each re-implementing (or skipping) it.
+  async removeAppData(appId) {
+    if (!appId) return;
+    if (typeof OPFS !== 'undefined' && OPFS.available && OPFS.root) {
+      try { await OPFS.deletePath('data/' + appId, true); } catch { /* ignore */ }
+    }
+    delete this._handles?.[appId];
+    delete this.vfsFolders?.[appId];
+    if (typeof FS === 'undefined') return;
+    try {
+      const dataNode = FS.getByPath('/data');
+      if (!dataNode) return;
+      const files = FS.listDir(dataNode.id);
+      const match = files.find(f => f.name === appId && f.type === 'folder');
+      if (!match) return;
+      try {
+        await FS.permanentDelete(match.id);
+      } catch (e) {
+        console.warn('[AppDirs] permanentDelete failed for', appId, e);
+        const children = FS.listDir(match.id);
+        for (const child of children) {
+          try { await FS.permanentDelete(child.id); } catch { /* ignore */ }
+        }
+      }
+    } catch (e) {
+      console.warn('[AppDirs] removeAppData failed for', appId, e);
+    }
+  },
+
   async setPrefs(appIdOrPkg, data) {
     const appDir = await this.getAppDir(appIdOrPkg);
     if (!appDir) return false;
@@ -812,18 +948,46 @@ const AppDirs = {
   },
 
   LS_MAP: {
-    'calendar_events_v2':    { pkg: 'com.nbosp.calendar',   subdir: 'databases',    file: 'events.json' },
-    'nbosp_clock_v1':        { pkg: 'com.nbosp.clock',      subdir: 'databases',    file: 'alarms.json' },
-    'nbosp_email_accts_v2':  { pkg: 'com.nbosp.email',      subdir: 'databases',    file: 'accounts.json' },
-    'nbosp_email_drafts_v1': { pkg: 'com.nbosp.email',      subdir: 'databases',    file: 'drafts.json' },
-    'nova_downloads':         { pkg: 'com.nbosp.downloads',  subdir: 'databases',    file: 'history.json' },
-    'nova_contacts':          { pkg: 'com.nbosp.contacts',   subdir: 'databases',    file: 'contacts.json' },
-    'nova_music_prefs':       { pkg: 'com.nbosp.music',      subdir: 'shared_prefs', file: 'prefs.json' },
-    'nova_installed_apps':    { pkg: 'com.nbosp.appmanager', subdir: 'databases',    file: 'packages.json' },
+    'calendar_events_v2':    { pkg: 'com.nbosp.calendar',    subdir: 'databases',    file: 'events.json' },
+    'nbosp_clock_v1':        { pkg: 'com.nbosp.clock',       subdir: 'databases',    file: 'alarms.json' },
+    'nbosp_email_accts_v2':  { pkg: 'com.nbosp.email',       subdir: 'databases',    file: 'accounts.json' },
+    'nbosp_email_drafts_v1': { pkg: 'com.nbosp.email',       subdir: 'databases',    file: 'drafts.json' },
+    'nova_downloads':         { pkg: 'com.nbosp.downloads',   subdir: 'databases',    file: 'history.json' },
+    'nova_contacts':          { pkg: 'com.nbosp.contacts',    subdir: 'databases',    file: 'contacts.json' },
+    'nova_music_prefs':       { pkg: 'com.nbosp.music',       subdir: 'shared_prefs', file: 'prefs.json' },
+    'nova_installed_apps':    { pkg: 'com.nbosp.appmanager',  subdir: 'databases',    file: 'packages.json' },
+
+    // App Manager — install log, disabled-apps list, boot-apps list
+    'nova_appmanager_log':    { pkg: 'com.nbosp.appmanager',  subdir: 'databases',    file: 'install-log.json' },
+    'nova_disabled_apps':     { pkg: 'com.nbosp.appmanager',  subdir: 'shared_prefs', file: 'disabled-apps.json' },
+    'nova_boot_apps':         { pkg: 'com.nbosp.appmanager',  subdir: 'shared_prefs', file: 'boot-apps.json' },
+
+    // Browser — settings, bookmarks, history
+    'nbosp_browser_settings': { pkg: 'com.nbosp.browser',     subdir: 'shared_prefs', file: 'settings.json' },
+    'nbosp_browser_bookmarks':{ pkg: 'com.nbosp.browser',     subdir: 'databases',    file: 'bookmarks.json' },
+    'nbosp_browser_history':  { pkg: 'com.nbosp.browser',     subdir: 'databases',    file: 'history.json' },
+
+    // Events (system log viewer) — filters, saved views, alert rules, sessions
+    'nova_events_app_filters':{ pkg: 'com.nbosp.events',      subdir: 'shared_prefs', file: 'filters.json' },
+    'nova_events_views':      { pkg: 'com.nbosp.events',      subdir: 'databases',    file: 'saved-views.json' },
+    'nova_events_alerts':     { pkg: 'com.nbosp.events',      subdir: 'databases',    file: 'alert-rules.json' },
+    'nova_events_sessions':   { pkg: 'com.nbosp.events',      subdir: 'databases',    file: 'sessions.json' },
+
+    // Developer Console — command history
+    'nbosp_devconsole_history': { pkg: 'com.nbosp.devconsole', subdir: 'databases',   file: 'history.json' },
+
+    // Permissions — event-log read cutoff
+    'nbosp_permissions_log_cutoff': { pkg: 'com.nbosp.permissions', subdir: 'shared_prefs', file: 'log-cutoff.json' },
+
+    // Settings — custom keyboard shortcuts
+    'novabyte-shortcuts':     { pkg: 'com.nbosp.settings',    subdir: 'shared_prefs', file: 'shortcuts.json' },
   },
 
-  getVFSDir(pkg, subdir) {
-    return this.vfsFolders?.[pkg]?.[subdir] ?? null;
+  getVFSDir(appIdOrPkg, subdir) {
+    const pkg = this.PACKAGES[appIdOrPkg] || appIdOrPkg;
+    if (this.vfsFolders?.[pkg]) return this.vfsFolders[pkg][subdir] ?? null;
+    void this.ensureAppDataFolder(pkg);
+    return null;
   },
 
   async syncKey(lsKey, value) {
@@ -864,13 +1028,30 @@ const AppDirs = {
         await legacyData.removeEntry(pkg, { recursive: true });
       } catch { /* ignore */ }
       delete this._handles[pkg];
+      delete this.vfsFolders?.[pkg];
       const appDir = await data.getDirectoryHandle(pkg, { create: true });
-      const mkd = (p, n) => p.getDirectoryHandle(n, { create: true });
+      const mkd = async (p, n) => { try { await p.getDirectoryHandle(n, { create: true }); } catch {} };
       await mkd(appDir, 'files');
       await mkd(appDir, 'cache');
       await mkd(appDir, 'databases');
       await mkd(appDir, 'shared_prefs');
       this._handles[pkg] = appDir;
+      try {
+        const dataNodeId = FS.specialFolders?.data || (await this._ensureDataNode());
+        const appNode = await this._ensureVFSChild(dataNodeId, pkg, 'folder');
+        const filesNode = await this._ensureVFSChild(appNode.id, 'files', 'folder');
+        const cacheNode = await this._ensureVFSChild(appNode.id, 'cache', 'folder');
+        const dbNode = await this._ensureVFSChild(appNode.id, 'databases', 'folder');
+        const prefsNode = await this._ensureVFSChild(appNode.id, 'shared_prefs', 'folder');
+        if (!this.vfsFolders) this.vfsFolders = {};
+        this.vfsFolders[pkg] = {
+          root: appNode.id,
+          files: filesNode?.id,
+          cache: cacheNode?.id,
+          databases: dbNode?.id,
+          shared_prefs: prefsNode?.id,
+        };
+      } catch { /* ignore VFS clear errors */ }
       return true;
     } catch {
       return false;
@@ -912,60 +1093,330 @@ function _makeIconDraggable(icon, desktopEl, key, iconPositions) {
   _iconDragControllers.push(ac);
 
   let isDragging = false;
+  let dragStarted = false; // true only once movement has crossed DRAG_THRESHOLD
   let startX = 0, startY = 0, initialX = 0, initialY = 0;
+  let originalX = 0, originalY = 0;
+  let overTaskbar = false;
+  const DRAG_THRESHOLD = 4; // px — below this, mousedown+mouseup is a click, not a drag
+
+  function getAppId() {
+    return key.startsWith('app:') ? key.slice(4) : icon.dataset.shortcutTarget;
+  }
+
+  function addPlusBadge() {
+    if (icon.querySelector('.pin-plus-badge')) return;
+    const badge = document.createElement('div');
+    badge.className = 'pin-plus-badge';
+    badge.textContent = '+';
+    icon.appendChild(badge);
+  }
+
+  function removePlusBadge() {
+    const badge = icon.querySelector('.pin-plus-badge');
+    if (badge) badge.remove();
+  }
+
+  function setTaskbarHover(active) {
+    if (active === overTaskbar) return;
+    overTaskbar = active;
+    const taskbar = document.getElementById('taskbar');
+    const label = icon.querySelector('.desktop-icon-label');
+    if (active) {
+      icon.style.transform = 'scale(0.75)';
+      icon.style.opacity = '0.9';
+      addPlusBadge();
+      taskbar?.classList.add('drag-over');
+      if (label) label.style.display = 'none';
+    } else {
+      icon.style.transform = '';
+      icon.style.opacity = '';
+      removePlusBadge();
+      taskbar?.classList.remove('drag-over');
+      if (label) label.style.display = '';
+    }
+  }
 
   icon.addEventListener('mousedown', (e) => {
     if (e.button !== 0) return;
     isDragging = true;
+    dragStarted = false;
     startX = e.clientX;
     startY = e.clientY;
     const rect = icon.getBoundingClientRect();
-    const desktopRect = desktopEl.getBoundingClientRect();
-    initialX = rect.left - desktopRect.left;
-    initialY = rect.top - desktopRect.top;
-    icon.style.zIndex = '1000';
-    icon.style.transition = 'none';
+    initialX = rect.left;
+    initialY = rect.top;
+    originalX = rect.left - desktopEl.getBoundingClientRect().left;
+    originalY = rect.top - desktopEl.getBoundingClientRect().top;
+    // NOTE: reparenting to document.body and bumping z-index/dragging state
+    // now happens lazily in mousemove, once DRAG_THRESHOLD is crossed — not
+    // here. Doing it unconditionally on every mousedown meant a plain click
+    // (mousedown immediately followed by mouseup at ~the same spot) still
+    // ran the full "drop" path below: it reparented the icon out of the
+    // desktop container, rewrote its stored position via
+    // OS.settings.set('desktopIconPositions', ...), and re-appended it —
+    // which fires the settings-change listener that re-renders the whole
+    // desktop, and can visibly nudge the icon if the reparent-triggered
+    // reflow changes its measured rect even slightly. A single click should
+    // only select the icon.
   });
 
-  // FIX: { signal } option — AbortController.abort() removes these document listeners cleanly
   document.addEventListener('mousemove', (e) => {
     if (!isDragging) return;
     const dx = e.clientX - startX;
     const dy = e.clientY - startY;
-    const desktopRect = desktopEl.getBoundingClientRect();
-    const newX = Math.max(0, Math.min(initialX + dx, desktopRect.width - icon.offsetWidth));
-    const newY = Math.max(0, Math.min(initialY + dy, desktopRect.height - icon.offsetHeight));
-    icon.style.position = 'absolute';
-    icon.style.left = `${newX}px`;
-    icon.style.top = `${newY}px`;
+
+    if (!dragStarted) {
+      if (Math.abs(dx) < DRAG_THRESHOLD && Math.abs(dy) < DRAG_THRESHOLD) return;
+      // Threshold crossed — this is now a real drag. Do the reparent/style
+      // work that used to happen unconditionally on mousedown.
+      dragStarted = true;
+      icon.style.zIndex = '99999';
+      icon.style.transition = 'none';
+      icon.classList.add('dragging');
+      document.body.appendChild(icon);
+    }
+
+    const newX = initialX + dx;
+    const newY = initialY + dy;
+
+    const isAppIcon = key.startsWith('app:');
+    const shortcutTarget = icon.dataset.shortcutTarget;
+    const canPin = isAppIcon || shortcutTarget;
+
+    if (canPin) {
+      icon.style.position = 'fixed';
+      icon.style.left = `${newX}px`;
+
+      const taskbar = document.getElementById('taskbar');
+      let over = false;
+      if (taskbar) {
+        const tbRect = taskbar.getBoundingClientRect();
+        const cx = e.clientX;
+        const cy = e.clientY;
+        over = cx > tbRect.left && cx < tbRect.right && cy > tbRect.top && cy < tbRect.bottom;
+        setTaskbarHover(over);
+      }
+
+      if (over) {
+        icon.style.top = `${newY}px`;
+      } else {
+        const maxY = taskbar ? taskbar.getBoundingClientRect().top - icon.offsetHeight : window.innerHeight;
+        icon.style.top = `${Math.min(newY, maxY)}px`;
+      }
+    } else {
+      const taskbar = document.getElementById('taskbar');
+      const maxY = taskbar ? taskbar.getBoundingClientRect().top - icon.offsetHeight : window.innerHeight;
+      const clampedY = Math.min(newY, maxY);
+      icon.style.position = 'fixed';
+      icon.style.left = `${newX}px`;
+      icon.style.top = `${clampedY}px`;
+    }
   }, { signal });
 
   document.addEventListener('mouseup', () => {
     if (!isDragging) return;
     isDragging = false;
+
+    if (!dragStarted) {
+      // Never crossed the threshold — this was a click, not a drag. Icon
+      // was never reparented or restyled, so there's nothing to undo and
+      // nothing to write back to desktopIconPositions.
+      return;
+    }
+    dragStarted = false;
+
     icon.style.zIndex = '';
     icon.style.transition = '';
-    const rect = icon.getBoundingClientRect();
-    const desktopRect = desktopEl.getBoundingClientRect();
-    iconPositions[key] = {
-      x: rect.left - desktopRect.left,
-      y: rect.top - desktopRect.top,
-    };
-    OS.settings.set('desktopIconPositions', iconPositions);
+    icon.classList.remove('dragging');
+
+    const pinnedNow = overTaskbar;
+    const appId = getAppId();
+    setTaskbarHover(false);
+
+    if (pinnedNow && appId) {
+      const pins = OS.settings.get('pinnedApps') || [];
+      if (!pins.includes(appId)) {
+        pins.push(appId);
+        OS.settings.set('pinnedApps', pins);
+        if (typeof WM !== 'undefined' && WM.updateTaskbar) WM.updateTaskbar();
+        const app = OS.apps[appId];
+        Notify.show({ title: 'Pinned to Taskbar', body: `${app?.name || appId} pinned to taskbar`, type: 'success', appName: 'Desktop' });
+      } else {
+        Notify.show({ title: 'Already Pinned', body: `${OS.apps[appId]?.name || appId} is already pinned to taskbar`, type: 'info', appName: 'Desktop' });
+      }
+    }
+
+    let x, y;
+    if (pinnedNow) {
+      x = originalX;
+      y = originalY;
+    } else {
+      const rect = icon.getBoundingClientRect();
+      const desktopRect = desktopEl.getBoundingClientRect();
+      const rawX = rect.left - desktopRect.left;
+      const rawY = rect.top - desktopRect.top;
+      const target = _pixelToCell(rawX, rawY, desktopEl);
+
+      const occupantKey = _cellKeyOccupant(iconPositions, target.col, target.row, key);
+      if (occupantKey) {
+        // Windows-style swap: dropping this icon on another one's cell
+        // trades their positions instead of shoving this icon off to the
+        // next open slot. The occupant re-renders in its new cell on the
+        // next renderDesktopIcons() pass (triggered by the settings write
+        // below); this icon takes the cell being dropped on.
+        const occupantCell = _posToCell(iconPositions[key]) || _pixelToCell(originalX, originalY, desktopEl);
+        iconPositions[occupantKey] = { col: occupantCell.col, row: occupantCell.row };
+      }
+
+      const cell = target;
+      const pixel = _cellToPixel(cell.col, cell.row);
+      x = pixel.x; y = pixel.y;
+      iconPositions[key] = { col: cell.col, row: cell.row };
+      icon.style.position = 'absolute';
+      icon.style.left = `${x}px`;
+      icon.style.top = `${y}px`;
+      OS.settings.set('desktopIconPositions', iconPositions);
+      desktopEl.appendChild(icon);
+      if (typeof renderDesktopIcons === 'function') renderDesktopIcons();
+      return;
+    }
+    icon.style.position = 'absolute';
+    icon.style.left = `${x}px`;
+    icon.style.top = `${y}px`;
+    desktopEl.appendChild(icon);
   }, { signal });
 }
 
-// FIX: hoisted — was recreated on every renderDesktopIcons() call
-function _getInitialIconPosition(key, index, iconPositions) {
+// ── Desktop icon grid ────────────────────────────────────────────────
+// Icons used to store raw {x, y} pixel positions with a "push to nearest
+// free spot on overlap" resolver. That's why dragging felt inconsistent —
+// two icons a few pixels apart were both "valid" positions, so drops
+// landed in slightly different spots depending on exactly where the mouse
+// was released, and stored positions from a wider window didn't line up
+// with a grid at a narrower one. Everything below now snaps to a fixed
+// cell grid (col, row) — same layout model Windows/macOS use — so every
+// valid position is one of a fixed set of cells, not "anywhere that
+// doesn't overlap."
+const DESKTOP_GRID = {
+  cellW: 88,   // icon slot width, including horizontal spacing
+  cellH: 104,  // icon slot height, including vertical spacing + label
+  marginX: 12,
+  marginY: 12,
+};
+
+function _gridCols(desktopEl) {
+  const width = desktopEl ? desktopEl.getBoundingClientRect().width : window.innerWidth;
+  return Math.max(1, Math.floor((width - DESKTOP_GRID.marginX * 2) / DESKTOP_GRID.cellW));
+}
+
+function _gridRows(desktopEl) {
+  // Must be measured in the same coordinate space as the drop position
+  // (desktop-relative, from desktopEl's own rect), not viewport-relative.
+  // Mixing the two — comparing a desktop-relative Y against a viewport-
+  // relative taskbar top — was why drops always computed a row near the
+  // bottom of the *desktop's* box regardless of where the cursor actually
+  // was: the desktop area sits below the window titlebar, so its own
+  // height is shorter than (and offset from) the viewport height the old
+  // code was measuring against.
+  const el = desktopEl || document.getElementById('desktop');
+  const height = el ? el.getBoundingClientRect().height : window.innerHeight;
+  return Math.max(1, Math.floor((height - DESKTOP_GRID.marginY * 2) / DESKTOP_GRID.cellH));
+}
+
+function _cellToPixel(col, row) {
+  return {
+    x: DESKTOP_GRID.marginX + col * DESKTOP_GRID.cellW,
+    y: DESKTOP_GRID.marginY + row * DESKTOP_GRID.cellH,
+  };
+}
+
+// Converts a raw pixel drop point (e.g. cursor position from a drag) to
+// the nearest grid cell, clamped to stay within the visible desktop area.
+// Takes desktopEl so column count is measured against the actual desktop
+// container width, not window.innerWidth — mirrors the fix already applied
+// to _gridRows. Without this, _gridCols() fell back to window.innerWidth
+// (wider than the real desktop area, e.g. NBOSP-app-in-webapp), so `cols`
+// came out too high and the right-edge clamp never engaged early enough,
+// letting icons get dragged/dropped past the actual visible right edge.
+function _pixelToCell(x, y, desktopEl) {
+  const el = desktopEl || document.getElementById('desktop');
+  const cols = _gridCols(el);
+  const rows = _gridRows(el);
+  const col = Math.min(cols - 1, Math.max(0, Math.round((x - DESKTOP_GRID.marginX) / DESKTOP_GRID.cellW)));
+  const row = Math.min(rows - 1, Math.max(0, Math.round((y - DESKTOP_GRID.marginY) / DESKTOP_GRID.cellH)));
+  return { col, row };
+}
+
+// Legacy positions were stored as pixel {x, y}. Grid positions are stored
+// as {col, row}. This tells them apart so old saved layouts still resolve
+// to a reasonable cell on first load instead of breaking.
+function _posToCell(pos) {
+  if (pos && typeof pos.col === 'number' && typeof pos.row === 'number') return { col: pos.col, row: pos.row };
+  if (pos && typeof pos.x === 'number' && typeof pos.y === 'number') return _pixelToCell(pos.x, pos.y);
+  return null;
+}
+
+function _cellKeyOccupant(iconPositions, col, row, excludeKey) {
+  for (const [k, pos] of Object.entries(iconPositions)) {
+    if (k === excludeKey) continue;
+    const cell = _posToCell(pos);
+    if (cell && cell.col === col && cell.row === row) return k;
+  }
+  return null;
+}
+
+// Finds the nearest unoccupied cell to (col, row), searching outward in
+// rings so a drop near a full cell lands close by rather than jumping to
+// the first empty slot in reading order.
+function _findFreeCell(col, row, iconPositions, excludeKey, desktopEl) {
+  const el = desktopEl || document.getElementById('desktop');
+  const cols = _gridCols(el);
+  const rows = _gridRows(el);
+  const clamp = (c, r) => ({ col: Math.min(cols - 1, Math.max(0, c)), row: Math.min(rows - 1, Math.max(0, r)) });
+  if (!_cellKeyOccupant(iconPositions, col, row, excludeKey)) return clamp(col, row);
+  for (let radius = 1; radius < Math.max(cols, rows) + 1; radius++) {
+    for (let dr = -radius; dr <= radius; dr++) {
+      for (let dc = -radius; dc <= radius; dc++) {
+        if (Math.max(Math.abs(dr), Math.abs(dc)) !== radius) continue; // ring only
+        const c = col + dc, r = row + dr;
+        if (c < 0 || r < 0 || c >= cols || r >= rows) continue;
+        if (!_cellKeyOccupant(iconPositions, c, r, excludeKey)) return { col: c, row: r };
+      }
+    }
+  }
+  return clamp(col, row); // grid is full — overlap rather than escape the desktop
+}
+
+
+function _getInitialIconPosition(key, index, iconPositions, desktopEl) {
   const saved = iconPositions[key];
-  if (saved) return { left: `${saved.x}px`, top: `${saved.y}px`, position: 'absolute' };
-  const iconSize = 80;
-  const iconSpacing = 16;
-  const cols = Math.max(1, Math.floor((window.innerWidth - 40) / (iconSize + iconSpacing)));
-  const col = index % cols;
-  const row = Math.floor(index / cols);
-  const x = 20 + col * (iconSize + iconSpacing);
-  const y = 20 + row * (iconSize + iconSpacing + 24); // +24 for label height
+  if (saved) {
+    const cell = _posToCell(saved);
+    const { x, y } = _cellToPixel(cell.col, cell.row);
+    return { left: `${x}px`, top: `${y}px`, position: 'absolute' };
+  }
+
+  const cols = _gridCols(desktopEl || document.getElementById('desktop'));
+  const occupied = new Set();
+  for (const [k, pos] of Object.entries(iconPositions)) {
+    if (k === key) continue;
+    const cell = _posToCell(pos);
+    if (cell) occupied.add(`${cell.col},${cell.row}`);
+  }
+
+  let col = index % cols;
+  let row = Math.floor(index / cols);
+  if (occupied.has(`${col},${row}`)) {
+    for (let r = row; r < row + 50; r++) {
+      const startC = r === row ? col : 0;
+      for (let c = startC; c < cols; c++) {
+        if (!occupied.has(`${c},${r}`)) { col = c; row = r; break; }
+      }
+      if (!occupied.has(`${col},${row}`)) break;
+    }
+  }
+
+  const { x, y } = _cellToPixel(col, row);
   return { position: 'absolute', left: `${x}px`, top: `${y}px` };
 }
 
@@ -992,11 +1443,19 @@ async function _handleDesktopDrop(e, desktopEl) {
         });
         const desktopFolderId = FS.specialFolders.desktop;
         try {
+          const desktopFiles = FS.listDir(desktopFolderId);
+          const alreadyExists = desktopFiles.some(f =>
+            f.name === shortcutName && f.mimeType === 'application/x-app-shortcut'
+          );
+          if (alreadyExists) {
+            Notify.show({ title: 'Already Pinned', body: `${payload.appName} shortcut already exists on desktop`, type: 'info', appName: 'Desktop' });
+            return;
+          }
           await FS.createFile(desktopFolderId, shortcutName, shortcutContent, 'application/x-app-shortcut');
           const desktopRect = desktopEl.getBoundingClientRect();
-          const x = Math.max(0, Math.min(e.clientX - desktopRect.left, desktopRect.width - 80));
-          const y = Math.max(0, Math.min(e.clientY - desktopRect.top, desktopRect.height - 100));
-          iconPositions['app:' + payload.appId] = { x, y };
+          const dropCell = _pixelToCell(e.clientX - desktopRect.left, e.clientY - desktopRect.top, desktopEl);
+          const freeCell = _findFreeCell(dropCell.col, dropCell.row, iconPositions, 'app:' + payload.appId, desktopEl);
+          iconPositions['app:' + payload.appId] = { col: freeCell.col, row: freeCell.row };
           OS.settings.set('desktopIconPositions', iconPositions);
           renderDesktopIcons();
           Notify.show({ title: 'Shortcut Created', body: `${payload.appName} shortcut added to desktop`, type: 'success', appName: 'Desktop' });
@@ -1022,6 +1481,18 @@ async function _handleDesktopDrop(e, desktopEl) {
     // notification — fixes the race where filesAdded was always 0 in the original setTimeout.
     // FIX: binary files (images, audio, PDF, etc.) are read with readAsDataURL, not TextDecoder,
     // so they are stored intact instead of being corrupted.
+    // FIX: extract just the base64 payload from the data URL before storing — the VFS stores
+    // raw content strings, and apps like Music/Gallery expect base64 strings they can decode,
+    // not the full data:...;base64,... wrapper.
+    function extractBase64FromDataUrl(dataUrl) {
+      if (typeof dataUrl !== 'string') return dataUrl;
+      const comma = dataUrl.indexOf(',');
+      if (comma > -1 && dataUrl.slice(comma - 7, comma).toLowerCase() === ';base64') {
+        return dataUrl.slice(comma + 1);
+      }
+      return dataUrl;
+    }
+
     const TEXT_TYPES = new Set(['text/', 'application/json', 'application/xml', 'application/javascript', 'application/xhtml+xml']);
     const TEXT_EXTS = /\.(txt|md|json|xml|csv|js|ts|css|html|htm|svg|yaml|yml|toml|ini|sh|py|rb|java|c|cpp|h|rs)$/i;
 
@@ -1034,6 +1505,9 @@ async function _handleDesktopDrop(e, desktopEl) {
       if (extCheck.blocked) {
         Notify.show({ title: '🚫 File Blocked - Executable Type', body: `"${file.name}": ${extCheck.reason}`, type: 'error', appName: 'System' });
         console.warn('[Security] Blocked on extension:', { file: file.name, reason: extCheck.reason });
+        if (typeof EventLog !== 'undefined') {
+          EventLog.log({ app: 'Desktop', category: 'security', severity: 'warn', message: `Blocked file "${file.name}": ${extCheck.reason}`, data: { file: file.name, reason: extCheck.reason } });
+        }
         resolve(false);
         return;
       }
@@ -1052,12 +1526,16 @@ async function _handleDesktopDrop(e, desktopEl) {
               const threatList = scanResult.patterns.join(', ');
               Notify.show({ title: '⚠️ Malicious File Blocked', body: `"${file.name}" contains threats: ${threatList}`, type: 'error', appName: 'System' });
               console.warn('[Security] Malicious file blocked:', { file: file.name, threats: scanResult.threats, patterns: scanResult.patterns });
+              if (typeof EventLog !== 'undefined') {
+                EventLog.log({ app: 'Desktop', category: 'security', severity: 'error', message: `Blocked malicious file "${file.name}": ${threatList}`, data: { file: file.name, threats: scanResult.threats } });
+              }
               resolve(false);
               return;
             }
           } else {
-            // Binary: store as data URL so the VFS preserves the bytes intact
-            content = reader.result;
+            // Binary: store as base64 string so the VFS preserves the bytes intact
+            // and apps can decode it with Uint8Array.fromBase64 / atob.
+            content = extractBase64FromDataUrl(reader.result);
           }
 
           const mimeType = file.type || 'application/octet-stream';
@@ -1189,12 +1667,13 @@ function renderDesktopIcons() {
 
     const _showTbIndicator = () => {
       const rect = taskbar.getBoundingClientRect();
-      // Sit flush against the top edge of the taskbar, extending upward
       _tbIndicator.style.top = rect.top + 'px';
       _tbIndicator.style.transform = 'translateY(-100%)';
       _tbIndicator.style.display = 'block';
     };
-    const _hideTbIndicator = () => { _tbIndicator.style.display = 'none'; };
+    const _hideTbIndicator = () => {
+      _tbIndicator.style.display = 'none';
+    };
 
     taskbar.addEventListener('dragenter', (e) => {
       e.preventDefault();
@@ -1245,10 +1724,10 @@ function renderDesktopIcons() {
       tabindex: '0',
       'aria-label': app.name,
       role: 'button',
-      style: _getInitialIconPosition(key, idx, iconPositions)
+      style: _getInitialIconPosition(key, idx, iconPositions, desktop)
     });
     const img = createEl('div', { className: 'desktop-icon-img' });
-    img.innerHTML = svgIcon(app.icon, 40);
+    img.innerHTML = svgIcon(app.id && app.id.startsWith('webapp_') ? app.icon : (app.icon || '/assets/no_app_icon.svg'), 40);
     const label = createEl('div', { className: 'desktop-icon-label', textContent: app.name });
     icon.appendChild(img);
     icon.appendChild(label);
@@ -1276,14 +1755,21 @@ function renderDesktopIcons() {
           icon: 'pin',
           action: () => {
             const pins = OS.settings.get('pinnedApps') || [];
-            const next = isPinned ? pins.filter(id => id !== app.id) : [...pins, app.id];
-            OS.settings.set('pinnedApps', next);
-            WM.updateTaskbar();
-            Notify.show({
-              title: isPinned ? 'Unpinned' : 'Pinned',
-              body: `${app.name} ${isPinned ? 'removed from' : 'pinned to'} taskbar`,
-              type: 'success', appName: 'Desktop'
-            });
+            if (isPinned) {
+              const next = pins.filter(id => id !== app.id);
+              OS.settings.set('pinnedApps', next);
+              WM.updateTaskbar();
+              Notify.show({ title: 'Unpinned', body: `${app.name} removed from taskbar`, type: 'success', appName: 'Desktop' });
+            } else {
+              if (pins.includes(app.id)) {
+                Notify.show({ title: 'Already Pinned', body: `${app.name} is already pinned to taskbar`, type: 'info', appName: 'Desktop' });
+                return;
+              }
+              const next = [...pins, app.id];
+              OS.settings.set('pinnedApps', next);
+              WM.updateTaskbar();
+              Notify.show({ title: 'Pinned', body: `${app.name} pinned to taskbar`, type: 'success', appName: 'Desktop' });
+            }
           }
         }
       ];
@@ -1291,8 +1777,20 @@ function renderDesktopIcons() {
         items.push({ separator: true }, {
           label: 'Uninstall', icon: 'trash', danger: true,
           action: async () => {
-            if (!confirm(`Uninstall "${app.name}"?\n\nThis cannot be undone.`)) return;
+            const uninstallResult = await showModal(
+              'Uninstall App',
+              `Uninstall "${app.name}"? This cannot be undone.`,
+              [{ label: 'Cancel' }, { label: 'Uninstall', value: 'confirm', danger: true }]
+            );
+            if (uninstallResult !== 'confirm') return;
             try {
+              if (typeof WM !== 'undefined' && WM.closeWindow) {
+                const openWindowIds = [];
+                for (const [wid, wstate] of OS.windows) {
+                  if (wstate.appId === app.id) openWindowIds.push(wid);
+                }
+                await Promise.all(openWindowIds.map(wid => WM.closeWindow(wid)));
+              }
               if (window.NovaAppPackageStore?.removeApp) {
                 await NovaAppPackageStore.removeApp(app.id);
               } else {
@@ -1300,9 +1798,37 @@ function renderDesktopIcons() {
                 const updated = stored.filter(a => a.id !== app.id);
                 localStorage.setItem('nova_installed_apps', JSON.stringify(updated));
               }
+              try {
+                if (typeof AppSandbox !== 'undefined' && AppSandbox.clearAppPartition) {
+                  await AppSandbox.clearAppPartition(app.id);
+                }
+              } catch (err) {
+                console.warn('[Desktop] Failed to clear storage partition for', app.id, err);
+              }
+              try {
+                if (typeof AppDirs !== 'undefined' && AppDirs.removeAppData) {
+                  await AppDirs.removeAppData(app.id);
+                }
+              } catch (err) {
+                console.warn('[Desktop] Failed to clear app data for', app.id, err);
+              }
+              if (typeof AppRegistry !== 'undefined' && AppRegistry.unregisterApp) {
+                AppRegistry.unregisterApp(app.id);
+              }
               delete OS.apps[app.id];
               const ri = APP_REGISTRY.findIndex(a => a.id === app.id);
               if (ri > -1) APP_REGISTRY.splice(ri, 1);
+              OS.settings.set('pinnedApps', (OS.settings.get('pinnedApps') || []).filter(id => id !== app.id));
+              try {
+                const disabled = JSON.parse(localStorage.getItem('nova_disabled_apps') || '[]');
+                const updated = disabled.filter(x => (typeof x === 'string' ? x : x?.id) !== app.id);
+                localStorage.setItem('nova_disabled_apps', JSON.stringify(updated));
+              } catch { /* quota */ }
+              try {
+                const bootApps = JSON.parse(localStorage.getItem('nova_boot_apps') || '[]');
+                const updated = bootApps.filter(id => id !== app.id);
+                localStorage.setItem('nova_boot_apps', JSON.stringify(updated));
+              } catch { /* quota */ }
               try {
                 const desktopFolder = FS.specialFolders?.desktop;
                 if (desktopFolder) {
@@ -1340,6 +1866,8 @@ function renderDesktopIcons() {
     let isShortcut = false;
     let shortcutData = null;
 
+    const key = 'file:' + f.id;
+
     if (f.name.endsWith('.lnk') && f.mimeType === 'application/x-app-shortcut') {
       try {
         shortcutData = JSON.parse(f.content);
@@ -1347,18 +1875,36 @@ function renderDesktopIcons() {
       } catch { /* not a valid shortcut, treat as regular file */ }
     }
 
-    const key = 'file:' + f.id;
+    let targetApp = null;
+    if (isShortcut && shortcutData) {
+      const devMode = OS.settings.get('devMode');
+      targetApp = OS.apps?.[shortcutData.target];
+      if (!devMode && targetApp?.devOnly) return;
+
+      const appPosKey = 'app:' + shortcutData.target;
+      if (iconPositions[appPosKey] && !iconPositions[key]) {
+        iconPositions[key] = iconPositions[appPosKey];
+      }
+    }
     const icon = createEl('div', {
       className: 'desktop-icon',
       tabindex: '0',
       'aria-label': f.name,
       role: 'button',
-      style: _getInitialIconPosition(key, defaultApps.length + idx, iconPositions)
+      style: _getInitialIconPosition(key, defaultApps.length + idx, iconPositions, desktop),
+      'data-shortcut-target': isShortcut && shortcutData ? shortcutData.target : ''
     });
     const img = createEl('div', { className: 'desktop-icon-img' });
 
     if (isShortcut && shortcutData) {
-      img.innerHTML = svgIcon(shortcutData.icon, 40);
+      const isWebShortcut = shortcutData.target && shortcutData.target.startsWith('webapp_');
+      // Prefer the live icon from OS.apps over the snapshot baked into the
+      // .lnk file at pin-time — the target app's icon can change (e.g. a
+      // replace/reinstall with new artwork) without anything ever updating
+      // this file, since it's stored on disk and only ever written once.
+      const liveIcon = targetApp?.icon;
+      const iconToUse = isWebShortcut ? (liveIcon || shortcutData.icon) : (liveIcon || shortcutData.icon || '/assets/no_app_icon.svg');
+      img.innerHTML = svgIcon(iconToUse, 40);
       const arrow = createEl('div', {
         style: 'position:absolute;bottom:0;right:0;width:16px;height:16px;background:var(--accent);border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:10px;color:white;font-weight:bold;'
       });
@@ -1381,7 +1927,18 @@ function renderDesktopIcons() {
 
     icon.addEventListener('dblclick', () => {
       if (isShortcut && shortcutData) {
-        WM.createWindow(shortcutData.target);
+        // Web app shortcuts need openWebApp() (registry.js), which sets
+        // OS.apps[id].init() before creating the window — WM.createWindow()
+        // alone only renders content for apps that already define .init(),
+        // and a web app shortcut's target has never had one set at this
+        // point unless the app happened to be launched earlier this session
+        // from somewhere that did (only appmanager.js's Open button did).
+        // Without this, double-clicking the shortcut opened a blank window.
+        if (typeof shortcutData.target === 'string' && shortcutData.target.startsWith('webapp_') && typeof window.openWebApp === 'function') {
+          window.openWebApp(shortcutData.target.slice('webapp_'.length));
+        } else {
+          WM.createWindow(shortcutData.target);
+        }
       } else if (f.type === 'folder') {
         WM.createWindow('vault', { folderId: f.id });
       } else {
@@ -1396,21 +1953,193 @@ function renderDesktopIcons() {
       e.preventDefault();
       const viewOnly = OS.settings.get('filesViewOnly');
       const menuItems = [
-        { label: 'Open', icon: 'play', action: () => openFileWithDefaultApp(f) }
+        {
+          label: 'Open', icon: 'play',
+          action: () => {
+            if (isShortcut && shortcutData) {
+              if (typeof shortcutData.target === 'string' && shortcutData.target.startsWith('webapp_') && typeof window.openWebApp === 'function') {
+                window.openWebApp(shortcutData.target.slice('webapp_'.length));
+              } else {
+                WM.createWindow(shortcutData.target);
+              }
+            } else if (f.type === 'folder') {
+              WM.createWindow('vault', { folderId: f.id });
+            } else {
+              openFileWithDefaultApp(f);
+            }
+          }
+        }
       ];
+      if (isShortcut && shortcutData) {
+        menuItems.push(
+          {
+            label: 'Unpin from Desktop', icon: 'pin',
+            action: async () => {
+              try {
+                const fileKey = 'file:' + f.id;
+                delete iconPositions[fileKey];
+                OS.settings.set('desktopIconPositions', iconPositions);
+                await FS.permanentDelete(f.id);
+                renderDesktopIcons();
+                Notify.show({ title: 'Unpinned', body: `${f.name.replace(/\.lnk$/i, '')} removed from desktop`, type: 'success', appName: 'Desktop' });
+              } catch (err) {
+                Notify.show({ title: 'Error', body: `Failed to remove shortcut: ${err.message}`, type: 'error', appName: 'Desktop' });
+              }
+            }
+          },
+          { separator: true }
+        );
+        const targetApp = OS.apps?.[shortcutData.target];
+        if (targetApp) {
+          const pins = OS.settings.get('pinnedApps') || [];
+          const isPinned = pins.includes(shortcutData.target);
+          menuItems.push({
+            label: isPinned ? 'Unpin from Taskbar' : 'Pin to Taskbar',
+            icon: 'pin',
+            action: () => {
+              const pins = OS.settings.get('pinnedApps') || [];
+              if (isPinned) {
+                const next = pins.filter(id => id !== shortcutData.target);
+                OS.settings.set('pinnedApps', next);
+                WM.updateTaskbar();
+                Notify.show({ title: 'Unpinned', body: `${targetApp.name} removed from taskbar`, type: 'success', appName: 'Desktop' });
+              } else {
+                if (pins.includes(shortcutData.target)) {
+                  Notify.show({ title: 'Already Pinned', body: `${targetApp.name} is already pinned to taskbar`, type: 'info', appName: 'Desktop' });
+                  return;
+                }
+                const next = [...pins, shortcutData.target];
+                OS.settings.set('pinnedApps', next);
+                WM.updateTaskbar();
+                Notify.show({ title: 'Pinned', body: `${targetApp.name} pinned to taskbar`, type: 'success', appName: 'Desktop' });
+              }
+            }
+          }, { separator: true });
+        }
+      }
       if (!viewOnly) {
         menuItems.push(
           {
-            label: 'Rename', icon: 'edit',
+             label: 'Rename', icon: 'rename',
             action: async () => {
-              const name = await showPrompt('Rename', f.name);
-              if (name && name !== f.name) {
-                await FS.rename(f.id, name);
+              const name = await showPrompt('Rename', f.name.replace(/\.lnk$/i, ''));
+              if (name && name !== f.name.replace(/\.lnk$/i, '')) {
+                await FS.rename(f.id, name.endsWith('.lnk') ? name : name + '.lnk');
                 renderDesktopIcons();
               }
             }
           },
-          { separator: true },
+          { separator: true }
+        );
+      }
+      if (isShortcut && shortcutData) {
+        const storedApps = (() => {
+          try { return JSON.parse(localStorage.getItem('nova_installed_apps') || '[]'); } catch { return []; }
+        })();
+        const isUserApp = storedApps.some(a => a.id === shortcutData.target);
+        const isWebApp = typeof shortcutData.target === 'string' && shortcutData.target.startsWith('webapp_');
+        if (isWebApp) {
+          // Web app shortcuts aren't in nova_installed_apps (that's only
+          // native/package apps), so they were previously falling through
+          // both branches below with no removal option at all — the
+          // shortcut, taskbar pin, and WebAppManager record all had to be
+          // cleaned up by hand, in three different places, none of which
+          // existed on the desktop. Reuse the same removeWebApp() helper as
+          // the Web Apps tab and launchpad so all three stay in sync.
+          menuItems.push({
+            label: 'Remove Web App', icon: 'trash', danger: true,
+            action: async () => {
+              const appName = f.name.replace(/\.lnk$/i, '');
+              const removeResult = await showModal(
+                'Remove Web App',
+                `Remove "${appName}"?`,
+                [{ label: 'Cancel' }, { label: 'Remove', value: 'confirm', danger: true }]
+              );
+              if (removeResult !== 'confirm') return;
+              const waId = shortcutData.target.slice('webapp_'.length);
+              if (typeof window.removeWebApp === 'function') {
+                await window.removeWebApp(waId);
+              }
+              delete iconPositions['file:' + f.id];
+              delete iconPositions['app:' + shortcutData.target];
+              OS.settings.set('desktopIconPositions', iconPositions);
+              renderDesktopIcons();
+              Notify.show({ title: 'Removed', body: `${appName} has been removed.`, type: 'success', appName: 'Desktop' });
+            }
+          });
+        } else if (isUserApp) {
+          menuItems.push({
+            label: 'Uninstall', icon: 'trash', danger: true,
+            action: async () => {
+              const appId = shortcutData.target;
+              const appName = f.name.replace(/\.lnk$/i, '');
+              const uninstallResult = await showModal(
+                'Uninstall App',
+                `Uninstall "${appName}"? This cannot be undone.`,
+                [{ label: 'Cancel' }, { label: 'Uninstall', value: 'confirm', danger: true }]
+              );
+              if (uninstallResult !== 'confirm') return;
+              try {
+                if (typeof WM !== 'undefined' && WM.closeWindow) {
+                  const openWindowIds = [];
+                  for (const [wid, wstate] of OS.windows) {
+                    if (wstate.appId === appId) openWindowIds.push(wid);
+                  }
+                  await Promise.all(openWindowIds.map(wid => WM.closeWindow(wid)));
+                }
+                if (window.NovaAppPackageStore?.removeApp) {
+                  await NovaAppPackageStore.removeApp(appId);
+                } else {
+                  const stored = JSON.parse(localStorage.getItem('nova_installed_apps') || '[]');
+                  const updated = stored.filter(a => a.id !== appId);
+                  localStorage.setItem('nova_installed_apps', JSON.stringify(updated));
+                }
+                try {
+                  if (typeof AppSandbox !== 'undefined' && AppSandbox.clearAppPartition) {
+                    await AppSandbox.clearAppPartition(appId);
+                  }
+                } catch (err) {
+                  console.warn('[Desktop] Failed to clear storage partition for', appId, err);
+                }
+                try {
+                  if (typeof AppDirs !== 'undefined' && AppDirs.removeAppData) {
+                    await AppDirs.removeAppData(appId);
+                  }
+                } catch (err) {
+                  console.warn('[Desktop] Failed to clear app data for', appId, err);
+                }
+                if (typeof AppRegistry !== 'undefined' && AppRegistry.unregisterApp) {
+                  AppRegistry.unregisterApp(appId);
+                }
+                delete OS.apps[appId];
+                const ri = APP_REGISTRY.findIndex(a => a.id === appId);
+                if (ri > -1) APP_REGISTRY.splice(ri, 1);
+                OS.settings.set('pinnedApps', (OS.settings.get('pinnedApps') || []).filter(id => id !== appId));
+                try {
+                  const disabled = JSON.parse(localStorage.getItem('nova_disabled_apps') || '[]');
+                  const updated = disabled.filter(x => (typeof x === 'string' ? x : x?.id) !== appId);
+                  localStorage.setItem('nova_disabled_apps', JSON.stringify(updated));
+                } catch { /* quota */ }
+                try {
+                  const bootApps = JSON.parse(localStorage.getItem('nova_boot_apps') || '[]');
+                  const updated = bootApps.filter(id => id !== appId);
+                  localStorage.setItem('nova_boot_apps', JSON.stringify(updated));
+                } catch { /* quota */ }
+                await FS.permanentDelete(f.id);
+                delete iconPositions['file:' + f.id];
+                delete iconPositions['app:' + appId];
+                OS.settings.set('desktopIconPositions', iconPositions);
+                renderDesktopIcons();
+                WM.updateTaskbar();
+                Notify.show({ title: 'Uninstalled', body: `${appName} has been removed.`, type: 'success', appName: 'Desktop' });
+              } catch (err) {
+                Notify.show({ title: 'Error', body: `Failed to uninstall: ${err.message}`, type: 'error', appName: 'Desktop' });
+              }
+            }
+          });
+        }
+      } else if (!viewOnly) {
+        menuItems.push(
           {
             label: 'Move to Trash', icon: 'trash', danger: true,
             action: async () => {
@@ -1425,3 +2154,75 @@ function renderDesktopIcons() {
     desktop.appendChild(icon);
   });
 }
+
+OS.events.on('settings:changed', async ({ key }) => {
+  if (key !== 'devMode') return;
+
+  const devMode = OS.settings.get('devMode');
+  let iconPositions = OS.settings.get('desktopIconPositions') || {};
+  const devAppIds = new Set();
+  for (const [appId, app] of Object.entries(OS.apps || {})) {
+    if (app.devOnly) devAppIds.add(appId);
+  }
+
+  const devShortcutFileKeys = new Set();
+  try {
+    const desktopFolder = FS.specialFolders.desktop;
+    if (desktopFolder) {
+      const files = FS.listDir(desktopFolder);
+      for (const f of files) {
+        if (f.name.endsWith('.lnk') && f.mimeType === 'application/x-app-shortcut') {
+          try {
+            const data = JSON.parse(f.content || '{}');
+            if (data?.type === 'app-shortcut' && devAppIds.has(data.target)) {
+              devShortcutFileKeys.add('file:' + f.id);
+            }
+          } catch { /* skip invalid shortcuts */ }
+        }
+      }
+    }
+  } catch { /* FS not ready yet */ }
+
+  if (!devMode) {
+    const hiddenDevPositions = {};
+    for (const [k, pos] of Object.entries(iconPositions)) {
+      const appId = k.startsWith('app:') ? k.slice(4) : null;
+      if (appId && devAppIds.has(appId)) {
+        hiddenDevPositions[k] = { ...pos };
+        delete iconPositions[k];
+      } else if (devShortcutFileKeys.has(k)) {
+        hiddenDevPositions[k] = { ...pos };
+        delete iconPositions[k];
+      }
+    }
+    OS.settings.set('desktopIconPositions', iconPositions);
+    OS.settings.set('_hiddenDevIconPositions', hiddenDevPositions);
+  } else {
+    const hiddenDevPositions = OS.settings.get('_hiddenDevIconPositions') || {};
+
+    for (const [k, pos] of Object.entries(hiddenDevPositions) || {}) {
+      if (!k.startsWith('app:')) continue;
+      const cell = _posToCell(pos);
+      if (!cell) continue;
+      for (const [otherKey, otherPos] of Object.entries(iconPositions)) {
+        const otherAppId = otherKey.startsWith('app:') ? otherKey.slice(4) : null;
+        if (otherAppId && devAppIds.has(otherAppId)) continue;
+        const otherCell = _posToCell(otherPos);
+        if (otherCell && otherCell.col === cell.col && otherCell.row === cell.row) {
+          const newCell = _findFreeCell(otherCell.col, otherCell.row, iconPositions, otherKey);
+          iconPositions[otherKey] = { col: newCell.col, row: newCell.row };
+        }
+      }
+    }
+
+    for (const [k, pos] of Object.entries(hiddenDevPositions)) {
+      iconPositions[k] = pos;
+    }
+    OS.settings.set('desktopIconPositions', iconPositions);
+    OS.settings.set('_hiddenDevIconPositions', null);
+  }
+
+  if (typeof renderDesktopIcons === 'function') renderDesktopIcons();
+  if (typeof WM !== 'undefined' && WM.updateTaskbar) WM.updateTaskbar();
+  if (document.getElementById('launchpad')?.classList.contains('active')) renderLaunchpad();
+});

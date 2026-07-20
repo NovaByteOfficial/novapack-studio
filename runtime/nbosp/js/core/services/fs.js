@@ -45,6 +45,9 @@ const FS = {
       this.updateSearchIndex();
     } catch (e) {
       console.warn('[FS] createDefaultFS failed, retrying once:', e);
+      if (typeof EventLog !== 'undefined') {
+        EventLog.log({ app: 'FS', category: 'filesystem', severity: 'error', message: `FS init failed, retrying: ${e?.message || e}` });
+      }
       await this.createDefaultFS();
     }
   },
@@ -128,6 +131,38 @@ const FS = {
     });
   },
 
+  // Given a desired name for a new/moved child of parentId, returns a name
+  // that doesn't collide with an existing sibling — appending " (1)",
+  // " (2)", etc. before the last extension until one is free. Shared by
+  // any caller that creates, copies, or moves files/folders (the Files
+  // app and the desktop's empty-area "New File"/"New Folder" menu), so
+  // none of them silently produce two siblings with the same name.
+  // Pass excludeId when checking a node that may already be a sibling of
+  // parentId (e.g. moving it within the same folder), so it isn't
+  // compared against itself.
+  uniqueName(parentId, name, excludeId) {
+    const siblings = new Set(
+      this.listDir(parentId)
+        .filter(f => f.id !== excludeId)
+        .map(f => f.name)
+    );
+    if (!siblings.has(name)) return name;
+
+    const dot = name.lastIndexOf('.');
+    // No extension, or a leading dot (e.g. ".gitignore") — treat as no extension.
+    const hasExt = dot > 0;
+    const base = hasExt ? name.slice(0, dot) : name;
+    const ext  = hasExt ? name.slice(dot) : '';
+
+    let i = 1;
+    let candidate;
+    do {
+      candidate = `${base} (${i})${ext}`;
+      i++;
+    } while (siblings.has(candidate));
+    return candidate;
+  },
+
   getPath(id) {
     const parts = [];
     let node = this.files.get(id);
@@ -179,6 +214,9 @@ const FS = {
     await OS.workers.fs.call('putFiles', [node]);
     this.updateSearchIndex();
     OS.events.emit('fs:created', node);
+    if (typeof EventLog !== 'undefined') {
+      EventLog.log({ app: 'FS', category: 'filesystem', severity: 'info', message: `Created file ${name}`, data: { id: node.id, parentId, mimeType: node.mimeType } });
+    }
     return node;
   },
 
@@ -195,6 +233,9 @@ const FS = {
     this._indexFile(node);
     await OS.workers.fs.call('putFiles', [node]);
     OS.events.emit('fs:created', node);
+    if (typeof EventLog !== 'undefined') {
+      EventLog.log({ app: 'FS', category: 'filesystem', severity: 'info', message: `Created folder ${name}`, data: { id: node.id, parentId } });
+    }
     return node;
   },
 
@@ -208,16 +249,23 @@ const FS = {
     await OS.workers.fs.call('putFiles', [node]); 
     this.updateSearchIndex();
     OS.events.emit('fs:updated', node);
+    if (typeof EventLog !== 'undefined') {
+      EventLog.log({ app: 'FS', category: 'filesystem', severity: 'info', message: `Wrote content to ${node.name}`, data: { id, size: node.size } });
+    }
     return node;
   },
 
   async rename(id, newName) {
     const node = this.files.get(id);
     if (!node) return null;
+    const oldName = node.name;
     node.name = newName;
     node.modified = Date.now();
     await OS.workers.fs.call('putFiles', [node]);
     OS.events.emit('fs:updated', node);
+    if (typeof EventLog !== 'undefined') {
+      EventLog.log({ app: 'FS', category: 'filesystem', severity: 'info', message: `Renamed ${oldName} → ${newName}`, data: { id, oldName, newName } });
+    }
     return node;
   },
 
@@ -230,7 +278,57 @@ const FS = {
     this._indexFile(node);
     await OS.workers.fs.call('putFiles', [node]);
     OS.events.emit('fs:moved', node);
+    if (typeof EventLog !== 'undefined') {
+      EventLog.log({ app: 'FS', category: 'filesystem', severity: 'info', message: `Moved ${node.name}`, data: { id, newParentId } });
+    }
     return node;
+  },
+
+  // Recursively copies a file or folder node (and, for folders, every
+  // descendant) into destParentId. Shared by any paste implementation
+  // (Files app, desktop context menu) so copying a folder always produces
+  // a real folder with its contents, not a flattened file.
+  //
+  // name collisions: only the top-level copy needs a name override —
+  // pass one in via `name` if the caller already deduped it with
+  // uniqueName(). Recursive calls always target a folder just created
+  // fresh, so its children can never already have a same-named sibling.
+  async copyNodeInto(node, destParentId, name) {
+    const finalName = name ?? node.name;
+    if (node.type === 'folder') {
+      const newFolder = await this.createFolder(destParentId, finalName);
+      for (const child of this.listDir(node.id)) {
+        await this.copyNodeInto(child, newFolder.id);
+      }
+      return newFolder;
+    }
+    return this.createFile(destParentId, finalName, node.content, node.mimeType);
+  },
+
+  // Performs a full cut/copy paste of `clip` ({ type: 'cut'|'copy', fileId })
+  // into destParentId, deduping names against existing siblings. Shared by
+  // the Files app and the desktop's empty-area context menu so "Paste"
+  // behaves identically everywhere instead of each caller reimplementing
+  // move/copy semantics. Returns the pasted/moved node, or null if there
+  // was nothing valid to paste.
+  async pasteInto(clip, destParentId) {
+    if (!clip?.fileId) return null;
+    const src = this.files.get(clip.fileId);
+    if (!src) return null;
+
+    if (clip.type === 'cut') {
+      await this.move(src.id, destParentId);
+      // Dedupe against the destination's existing children (excluding src
+      // itself, in case it's a same-folder move-in-place) so moving into a
+      // folder with a same-named item lands as "name (1).ext" instead of
+      // silently colliding.
+      const finalName = this.uniqueName(destParentId, src.name, src.id);
+      if (finalName !== src.name) await this.rename(src.id, finalName);
+      return src;
+    }
+
+    const finalName = this.uniqueName(destParentId, src.name);
+    return this.copyNodeInto(src, destParentId, finalName);
   },
 
   async deleteToTrash(id) {
@@ -243,6 +341,9 @@ const FS = {
     this._indexFile(node);
     await OS.workers.fs.call('putFiles', [node]);
     OS.events.emit('fs:deleted', node);
+    if (typeof EventLog !== 'undefined') {
+      EventLog.log({ app: 'FS', category: 'filesystem', severity: 'warn', message: `Moved ${node.name} to Trash`, data: { id } });
+    }
   },
 
   async permanentDelete(id) {
@@ -261,6 +362,9 @@ const FS = {
     this.files.delete(id);
     await OS.workers.fs.call('deleteFile', id);
     OS.events.emit('fs:deleted', { id });
+    if (typeof EventLog !== 'undefined') {
+      EventLog.log({ app: 'FS', category: 'filesystem', severity: 'warn', message: `Permanently deleted ${node.name}`, data: { id, type: node.type } });
+    }
   },
 
   async emptyTrash() {

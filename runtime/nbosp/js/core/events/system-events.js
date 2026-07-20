@@ -51,6 +51,25 @@ const _THREAT_PATTERNS = Object.freeze([
   { regex: /eval\s*\(\s*decodeURIComponent/i,  name: 'uri-decode-eval', severity: 'critical' },
 ]);
 
+// ── Desktop shortcut helper ────────────────────────────────────────────────────
+function _hasDesktopShortcut(appId) {
+  try {
+    const desktopFolder = FS.specialFolders?.desktop;
+    if (!desktopFolder) return false;
+    const files = FS.listDir(desktopFolder);
+    for (const f of files) {
+      if (f.name.endsWith('.lnk') && f.mimeType === 'application/x-app-shortcut') {
+        try {
+          if (JSON.parse(f.content || '{}')?.target === appId) return true;
+        } catch { /* skip invalid shortcuts */ }
+      }
+    }
+    return false;
+  } catch {
+    return false;
+  }
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // LAUNCHPAD
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -59,18 +78,30 @@ document.getElementById('start-btn').addEventListener('click', toggleLaunchpad);
 
 function toggleLaunchpad() {
   const launchpad = document.getElementById('launchpad');
+  const isClosing = launchpad.classList.contains('active');
   launchpad.classList.toggle('active');
   if (launchpad.classList.contains('active')) {
     renderLaunchpad();
     const searchEl = document.getElementById('launchpad-search');
     searchEl.value = '';
-    searchEl.focus();
+    setTimeout(() => {
+      searchEl.focus();
+      searchEl.select();
+    }, 50);
+  } else if (isClosing) {
+    const marks = launchpad.querySelectorAll('.launchpad-name mark');
+    marks.forEach(mark => {
+      const parent = mark.parentNode;
+      if (parent) parent.replaceChild(document.createTextNode(mark.textContent), mark);
+      parent?.normalize?.();
+    });
   }
 }
 
 function renderLaunchpad() {
   const grid = document.getElementById('launchpad-grid');
-  const apps = APP_REGISTRY;
+  const devMode = OS.settings.get('devMode');
+  const apps = devMode ? APP_REGISTRY : APP_REGISTRY.filter(app => !app.devOnly);
   const webApps = (typeof WebAppManager !== 'undefined' && WebAppManager.getAllApps)
     ? WebAppManager.getAllApps()
     : [];
@@ -95,7 +126,7 @@ function renderLaunchpad() {
         draggable: 'true'
       });
       const icon = createEl('div', { className: 'launchpad-icon' });
-      icon.innerHTML = svgIcon(app.icon, 28);
+      icon.innerHTML = svgIcon(app.id && app.id.startsWith('webapp_') ? app.icon : (app.icon || '/assets/no_app_icon.svg'), 28);
       item.appendChild(icon);
       item.appendChild(createEl('div', { className: 'launchpad-name', textContent: app.name }));
 
@@ -119,25 +150,107 @@ function renderLaunchpad() {
             icon: 'pin',
             action: () => {
               const pins = OS.settings.get('pinnedApps') || [];
-              const next = isPinned ? pins.filter(id => id !== app.id) : [...pins, app.id];
-              OS.settings.set('pinnedApps', next);
-              WM.updateTaskbar();
-              Notify.show({
-                title: isPinned ? 'Unpinned' : 'Pinned',
-                body: `${app.name} ${isPinned ? 'removed from' : 'added to'} taskbar`,
-                type: 'success', appName: 'Launchpad'
-              });
+              if (isPinned) {
+                const next = pins.filter(id => id !== app.id);
+                OS.settings.set('pinnedApps', next);
+                WM.updateTaskbar();
+                Notify.show({ title: 'Unpinned', body: `${app.name} removed from taskbar`, type: 'success', appName: 'Launchpad' });
+              } else {
+                if (pins.includes(app.id)) {
+                  Notify.show({ title: 'Already Pinned', body: `${app.name} is already pinned to taskbar`, type: 'info', appName: 'Launchpad' });
+                  return;
+                }
+                const next = [...pins, app.id];
+                OS.settings.set('pinnedApps', next);
+                WM.updateTaskbar();
+                Notify.show({ title: 'Pinned', body: `${app.name} pinned to taskbar`, type: 'success', appName: 'Launchpad' });
+              }
             }
           }
         ];
+
+        const hasShortcut = _hasDesktopShortcut(app.id);
+        if (hasShortcut) {
+          menuItems.push({ separator: true }, {
+            label: 'Unpin from Desktop', icon: 'pin',
+            action: async () => {
+              try {
+                const desktopFolder = FS.specialFolders?.desktop;
+                if (desktopFolder) {
+                  const files = FS.listDir(desktopFolder);
+                  let removed = 0;
+                  const iconPositions = OS.settings.get('desktopIconPositions') || {};
+                  for (const f of files) {
+                    if (f.name.endsWith('.lnk') && f.mimeType === 'application/x-app-shortcut') {
+                      try {
+                        const data = JSON.parse(f.content || '{}');
+                        if (data?.type === 'app-shortcut' && data?.target === app.id) {
+                          await FS.permanentDelete(f.id);
+                          delete iconPositions['file:' + f.id];
+                          removed++;
+                        }
+                      } catch { /* skip invalid shortcuts */ }
+                    }
+                  }
+                  OS.settings.set('desktopIconPositions', iconPositions);
+                  renderDesktopIcons();
+                  WM.updateTaskbar();
+                  Notify.show({
+                    title: 'Unpinned from Desktop',
+                    body: removed > 0
+                      ? `Removed ${removed} desktop shortcut${removed > 1 ? 's' : ''} for ${app.name}`
+                      : `No desktop shortcuts found for ${app.name}`,
+                    type: 'success', appName: 'Launchpad'
+                  });
+                }
+              } catch (err) {
+                Notify.show({ title: 'Error', body: `Failed to unpin from desktop: ${err.message}`, type: 'error', appName: 'Launchpad' });
+              }
+            }
+          });
+        } else {
+          menuItems.push({ separator: true }, {
+            label: 'Pin to Desktop', icon: 'pin',
+            action: async () => {
+              try {
+                const desktopFolder = FS.specialFolders?.desktop;
+                if (desktopFolder) {
+                  const shortcutName = app.name + '.lnk';
+                  const shortcutContent = JSON.stringify({
+                    target: app.id,
+                    type: 'app-shortcut',
+                    icon: app.icon
+                  });
+                  await FS.createFile(desktopFolder, shortcutName, shortcutContent, 'application/x-app-shortcut');
+                  renderDesktopIcons();
+                  Notify.show({ title: 'Pinned to Desktop', body: `${app.name} shortcut added to desktop`, type: 'success', appName: 'Launchpad' });
+                }
+              } catch (err) {
+                Notify.show({ title: 'Error', body: `Failed to pin to desktop: ${err.message}`, type: 'error', appName: 'Launchpad' });
+              }
+            }
+          });
+        }
 
         if (isUserApp) {
           menuItems.push({ separator: true }, {
             label: 'Uninstall', icon: 'trash', danger: true,
             action: async () => {
               toggleLaunchpad();
-              if (!confirm(`Uninstall "${app.name}"?\n\nThis cannot be undone.`)) return;
+              const uninstallResult = await showModal(
+                'Uninstall App',
+                `Uninstall "${app.name}"? This cannot be undone.`,
+                [{ label: 'Cancel' }, { label: 'Uninstall', value: 'confirm', danger: true }]
+              );
+              if (uninstallResult !== 'confirm') return;
               try {
+                if (typeof WM !== 'undefined' && WM.closeWindow && typeof OS !== 'undefined' && OS.windows) {
+                  const openWindowIds = [];
+                  for (const [wid, wstate] of OS.windows) {
+                    if (wstate.appId === app.id) openWindowIds.push(wid);
+                  }
+                  await Promise.all(openWindowIds.map(wid => WM.closeWindow(wid)));
+                }
                 if (window.NovaAppPackageStore?.removeApp) {
                   await NovaAppPackageStore.removeApp(app.id);
                 } else {
@@ -147,11 +260,61 @@ function renderLaunchpad() {
                     JSON.stringify(stored.filter(a => a.id !== app.id))
                   );
                 }
+                try {
+                  if (typeof AppSandbox !== 'undefined' && AppSandbox.clearAppPartition) {
+                    await AppSandbox.clearAppPartition(app.id);
+                  }
+                } catch (err) {
+                  console.warn('[Launchpad] Failed to clear storage partition for', app.id, err);
+                }
+                try {
+                  if (typeof AppDirs !== 'undefined' && AppDirs.removeAppData) {
+                    await AppDirs.removeAppData(app.id);
+                  }
+                } catch (err) {
+                  console.warn('[Launchpad] Failed to clear app data for', app.id, err);
+                }
+                if (typeof AppRegistry !== 'undefined' && AppRegistry.unregisterApp) {
+                  AppRegistry.unregisterApp(app.id);
+                }
                 delete OS.apps[app.id];
                 const ri = APP_REGISTRY.findIndex(a => a.id === app.id);
                 if (ri > -1) APP_REGISTRY.splice(ri, 1);
+                OS.settings.set('pinnedApps', (OS.settings.get('pinnedApps') || []).filter(id => id !== app.id));
+                try {
+                  const disabled = JSON.parse(localStorage.getItem('nova_disabled_apps') || '[]');
+                  const updated = disabled.filter(x => (typeof x === 'string' ? x : x?.id) !== app.id);
+                  localStorage.setItem('nova_disabled_apps', JSON.stringify(updated));
+                } catch { /* quota */ }
+                try {
+                  const bootApps = JSON.parse(localStorage.getItem('nova_boot_apps') || '[]');
+                  const updated = bootApps.filter(id => id !== app.id);
+                  localStorage.setItem('nova_boot_apps', JSON.stringify(updated));
+                } catch { /* quota */ }
+                try {
+                  const desktopFolder = FS.specialFolders?.desktop;
+                  if (desktopFolder) {
+                    const files = FS.listDir(desktopFolder);
+                    for (const f of files) {
+                      if (f.name.endsWith('.lnk') && f.mimeType === 'application/x-app-shortcut') {
+                        try {
+                          const data = JSON.parse(f.content || '{}');
+                          if (data?.type === 'app-shortcut' && data?.target === app.id) {
+                            await FS.permanentDelete(f.id);
+                          }
+                        } catch { /* skip invalid shortcuts */ }
+                      }
+                    }
+                  }
+                } catch (err) {
+                  console.warn('[Launchpad] Failed to clean up shortcuts for', app.id, err);
+                  if (typeof EventLog !== 'undefined') {
+                    EventLog.log({ app: 'Launchpad', category: 'apps', severity: 'warn', message: `Failed to clean up desktop shortcuts for ${app.id}: ${err?.message || err}`, data: { appId: app.id } });
+                  }
+                }
                 renderDesktopIcons();
                 WM.updateTaskbar();
+                if (document.getElementById('launchpad')?.classList.contains('active')) renderLaunchpad();
                 Notify.show({ title: 'Uninstalled', body: `${app.name} has been removed.`, type: 'success', appName: 'Launchpad' });
               } catch (err) {
                 Notify.show({ title: 'Error', body: `Failed to uninstall: ${err.message}`, type: 'error', appName: 'Launchpad' });
@@ -235,73 +398,21 @@ function renderLaunchpad() {
 
         // #6: extracted launch logic so context-menu "Open" can call it directly
         // without going through item.click() which would double-fire toggleLaunchpad()
+        //
+        // Delegates to openWebApp() (registry.js), which sets OS.apps[id].init()
+        // so the webview actually renders. This used to build the <webview>
+        // by hand and append it to windowElement.content right after
+        // createWindow() returned — which meant a window opened this way
+        // rendered fine the first time, but reopening it later via the
+        // taskbar or a desktop shortcut (which just call WM.createWindow()
+        // with no iframe-building step) produced a blank window, since only
+        // this one call site ever built the content.
         function launchWebApp() {
           toggleLaunchpad();
           try {
-            const appData = WebAppManager.getApp(webApp.id);
-            if (!appData) throw new Error('Web app not found');
-            WebAppManager.launchApp(webApp.id);
-
-            const tempAppId = 'webapp_' + webApp.id;
-            if (!OS.apps[tempAppId]) {
-              OS.apps[tempAppId] = {
-                name: appData.name, icon: appData.icon,
-                defaultSize: [800, 600], minSize: [400, 300]
-              };
-            }
-            const windowElement = WM.createWindow(tempAppId);
-
-            const iframeContainer = document.createElement('div');
-            iframeContainer.style.cssText =
-              'width:100%;height:100%;display:flex;flex-direction:column;overflow:hidden;position:relative;';
-
-            const loader = document.createElement('div');
-            loader.style.cssText =
-              'position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);text-align:center;color:rgba(255,255,255,0.7);z-index:1000;';
-            // #16: avoid loader.innerHTML for dynamic content — use DOM
-            const loaderIcon = document.createElement('div');
-            loaderIcon.style.cssText = 'font-size:24px;margin-bottom:12px;';
-            loaderIcon.textContent = '⏳';
-            const loaderText = document.createElement('div');
-            loaderText.textContent = 'Loading...';
-            loader.appendChild(loaderIcon);
-            loader.appendChild(loaderText);
-
-            const hideLoader = () => { loader.style.display = 'none'; };
-
-            const iframe = document.createElement('webview');
-            iframe.style.cssText = 'flex:1;border:none;background:white;overflow:hidden;';
-            iframe.addEventListener('did-finish-load', hideLoader);
-            iframe.addEventListener('did-stop-loading', hideLoader);
-            iframe.addEventListener('did-fail-load', () => {
-              hideLoader();
-              loader.style.display = 'flex';
-              loader.innerHTML = '';
-              const errIcon = document.createElement('div');
-              errIcon.style.cssText = 'font-size:20px;margin-bottom:12px;';
-              errIcon.textContent = '❌';
-              const errText = document.createElement('div');
-              errText.textContent = 'Failed to load';
-              loader.appendChild(errIcon);
-              loader.appendChild(errText);
-            });
-            setTimeout(hideLoader, 5000);
-            iframe.src = appData.url;
-
-            const urlBar = document.createElement('div');
-            urlBar.style.cssText =
-              'background:rgba(255,255,255,0.08);border-bottom:1px solid rgba(255,255,255,0.1);padding:8px 16px;font-size:11px;color:rgba(255,255,255,0.5);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-family:monospace;';
-            try {
-              const urlObj = new URL(appData.url);
-              urlBar.textContent = `🔒 ${urlObj.host}`;
-            } catch {
-              urlBar.textContent = 'External Web App';
-            }
-
-            iframeContainer.appendChild(urlBar);
-            iframeContainer.appendChild(loader);
-            iframeContainer.appendChild(iframe);
-            if (windowElement?.content) windowElement.content.appendChild(iframeContainer);
+            if (typeof window.openWebApp !== 'function') throw new Error('Web app launcher unavailable');
+            const windowElement = window.openWebApp(webApp.id);
+            if (!windowElement) throw new Error('Web app not found');
           } catch (error) {
             Notify.show({
               title: 'Error', body: `Failed to launch app: ${error.message}`,
@@ -326,22 +437,37 @@ function renderLaunchpad() {
               label: waIsPinned ? 'Unpin from Taskbar' : 'Pin to Taskbar',
               icon: 'pin',
               action: () => {
-                const p    = OS.settings.get('pinnedApps') || [];
-                const next = waIsPinned ? p.filter(id => id !== waId) : [...p, waId];
-                OS.settings.set('pinnedApps', next);
-                if (typeof WM !== 'undefined' && WM.updateTaskbar) WM.updateTaskbar();
-                Notify.show({
-                  title: waIsPinned ? 'Unpinned' : 'Pinned',
-                  body: `${webApp.name} ${waIsPinned ? 'unpinned from' : 'pinned to'} taskbar`,
-                  type: 'success', appName: 'Launchpad'
-                });
+                const p = OS.settings.get('pinnedApps') || [];
+                if (waIsPinned) {
+                  const next = p.filter(id => id !== waId);
+                  OS.settings.set('pinnedApps', next);
+                  if (typeof WM !== 'undefined' && WM.updateTaskbar) WM.updateTaskbar();
+                  Notify.show({ title: 'Unpinned', body: `${webApp.name} unpinned from taskbar`, type: 'success', appName: 'Launchpad' });
+                } else {
+                  if (p.includes(waId)) {
+                    Notify.show({ title: 'Already Pinned', body: `${webApp.name} is already pinned to taskbar`, type: 'info', appName: 'Launchpad' });
+                    return;
+                  }
+                  const next = [...p, waId];
+                  OS.settings.set('pinnedApps', next);
+                  if (typeof WM !== 'undefined' && WM.updateTaskbar) WM.updateTaskbar();
+                  Notify.show({ title: 'Pinned', body: `${webApp.name} pinned to taskbar`, type: 'success', appName: 'Launchpad' });
+                }
               }
             },
             { separator: true },
             {
               label: 'Remove Web App', icon: 'trash', danger: true,
-              action: () => {
-                WebAppManager.removeApp(webApp.id);
+              action: async () => {
+                // removeWebApp (registry.js) also unpins from the taskbar
+                // and deletes any desktop .lnk shortcut, not just the
+                // WebAppManager record — matches the Web Apps tab's Remove
+                // button and the desktop shortcut's own Remove Web App item.
+                if (typeof window.removeWebApp === 'function') {
+                  await window.removeWebApp(webApp.id);
+                } else {
+                  WebAppManager.removeApp(webApp.id);
+                }
                 renderLaunchpad();
                 Notify.show({ title: 'Removed', body: `"${webApp.name}" has been removed`, type: 'success', appName: 'Launchpad' });
               }
@@ -433,23 +559,30 @@ function renderLaunchpad() {
 
 // ── Launchpad search ──────────────────────────────────────────────────────────
 document.getElementById('launchpad-search').addEventListener('input', debounce((e) => {
-  // #18: use e.target.value directly — `this` is unreliable inside debounce closures
   const q = e.target.value.toLowerCase().trim();
-
-  // #14: single querySelectorAll — reuse `items` for both filtering and count
   const items = document.querySelectorAll('.launchpad-item');
   let visibleCount = 0;
+  let firstMatch = null;
 
   items.forEach(item => {
-    const name  = item.querySelector('.launchpad-name')?.textContent.toLowerCase() ?? '';
+    const nameEl = item.querySelector('.launchpad-name');
+    const name  = (nameEl?.textContent || '').toLowerCase();
     const label = (item.getAttribute('aria-label') || '').toLowerCase();
-    const match = name.includes(q) || label.includes(q);
+    const match = q === '' || name.includes(q) || label.includes(q);
     item.style.display = match ? '' : 'none';
-    if (match) visibleCount++;
+    if (match) {
+      visibleCount++;
+      if (!firstMatch) firstMatch = item;
+      if (nameEl && q) {
+        const original = nameEl.textContent;
+        const escaped = q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        nameEl.innerHTML = original.replace(new RegExp(`(${escaped})`, 'gi'), '<mark style="background:var(--accent);color:#fff;border-radius:2px;padding:0 2px;">$1</mark>');
+      } else if (nameEl) {
+        nameEl.textContent = nameEl.textContent;
+      }
+    }
   });
 
-  // #8: count visible items from the already-fetched NodeList
-  // The old [style=""] selector never matched items that had animation styles set.
   let noResultsMsg = document.getElementById('launchpad-no-results');
   if (q && visibleCount === 0 && items.length > 0) {
     if (!noResultsMsg) {
@@ -466,6 +599,20 @@ document.getElementById('launchpad-search').addEventListener('input', debounce((
     noResultsMsg.style.display = 'none';
   }
 }, 150));
+
+document.getElementById('launchpad-search').addEventListener('keydown', (e) => {
+  if (e.key !== 'Enter') return;
+  const q = e.target.value.toLowerCase().trim();
+  const items = Array.from(document.querySelectorAll('.launchpad-item')).filter(item => item.style.display !== 'none');
+  if (!items.length) return;
+  if (!q) return;
+  const target = items.find(item => {
+    const name = item.querySelector('.launchpad-name')?.textContent?.toLowerCase() ?? '';
+    const label = (item.getAttribute('aria-label') || '').toLowerCase();
+    return name === q || label === q;
+  });
+  if (target) target.click();
+});
 
 // Close launchpad on backdrop click
 document.getElementById('launchpad').addEventListener('click', (e) => {
@@ -497,12 +644,29 @@ document.getElementById('notif-close').addEventListener('click', () => {
 });
 
 document.getElementById('notif-mark-all').addEventListener('click', () => {
-  OS.notifications = [];
-  OS.notifUnread   = 0;
-  Notify.persist();
-  Notify.updateBadge();
+  // Was OS.notifications = [] directly here, which bypassed
+  // Notify.clearAll() entirely — including the pinned-entry preservation
+  // it exists specifically to do. That wiped a "running in background"
+  // pinned notification (and its Terminate button) the same as any other
+  // entry, which defeats the whole point of it being non-dismissible: the
+  // app kept running with no visible way left to stop it. clearAll()
+  // does the identical OS.notifications/persist/badge/render sequence,
+  // it just filters to `n && n.pinned` first.
+  Notify.clearAll();
+  // clearAll() only updates Notify's own badge tracking (Notify.updateBadge),
+  // not this file's separate #notif-badge element — same gap already noted
+  // in the notif-mark-read handler below. Call it here too so the tray
+  // badge doesn't go stale.
   updateNotificationBadge();
-  Notify.renderPanel();
+});
+
+// Separate from Clear All — this keeps notification history but marks
+// everything as read. Notify.markAllRead() already does the mark, persist,
+// badge update, and re-render; it just doesn't touch this file's own tray
+// badge (updateNotificationBadge), so we call that here too.
+document.getElementById('notif-mark-read').addEventListener('click', () => {
+  Notify.markAllRead();
+  updateNotificationBadge();
 });
 
 // ── Notification badge ────────────────────────────────────────────────────────
@@ -597,8 +761,39 @@ if (volumeBtn && volumePopup && volumeSlider && volumeValue) {
 
   volumeSlider.addEventListener('click',  (e) => { e.stopPropagation(); });
   volumeSlider.addEventListener('input',  () => {
-    OS.volume = parseInt(volumeSlider.value, 10);
-    volumeValue.textContent = OS.volume + '%';
+    const newVolume = parseInt(volumeSlider.value, 10);
+    OS.volume = newVolume;
+    volumeValue.textContent = newVolume + '%';
+    try { OS.events.emit('os:volumeChanged', { volume: newVolume }); } catch {}
+
+    for (const [id, state] of (OS.windows || [])) {
+      if (state.appId === 'browser') {
+        const webviews = state.element?.querySelectorAll?.('webview');
+        if (webviews) {
+          // Volume is attacker-relevant here only in the sense that this
+          // string gets executed inside every open browser tab's webview —
+          // never build the executed source by concatenating a value into
+          // it, even a value that's "supposed" to already be a safe number.
+          // Clamp/validate defensively and pass the value through
+          // JSON.stringify so it becomes an unambiguous literal, not
+          // something an unexpected/NaN input could turn into a syntax
+          // break or, if this pattern gets copied elsewhere with a
+          // less-trusted value, an injection point.
+          const safeVolume = Number.isFinite(newVolume)
+            ? Math.min(1, Math.max(0, newVolume / 100))
+            : 1;
+          const volumeLiteral = JSON.stringify(safeVolume);
+          for (const webview of webviews) {
+            if (typeof webview.executeJavaScript === 'function') {
+              webview.executeJavaScript(
+                `(function(){var v=${volumeLiteral};` +
+                `document.querySelectorAll('audio,video').forEach(function(el){el.volume=v;});})();`
+              ).catch(function(){});
+            }
+          }
+        }
+      }
+    }
   });
 
   volumePopup.addEventListener('click', (e) => { e.stopPropagation(); });
@@ -688,15 +883,43 @@ if (desktopEl) {
       {
         label: 'New File', icon: 'file', action: async () => {
           const name = await showPrompt('New File Name', 'untitled.txt');
-          if (name) { await FS.createFile(FS.specialFolders.desktop, name, '', 'text/plain'); renderDesktopIcons(); }
+          if (name) {
+            const finalName = FS.uniqueName(FS.specialFolders.desktop, name);
+            await FS.createFile(FS.specialFolders.desktop, finalName, '', 'text/plain');
+            renderDesktopIcons();
+          }
         }
       },
       {
         label: 'New Folder', icon: 'folder', action: async () => {
           const name = await showPrompt('New Folder Name', 'New Folder');
-          if (name) { await FS.createFolder(FS.specialFolders.desktop, name); renderDesktopIcons(); }
+          if (name) {
+            const finalName = FS.uniqueName(FS.specialFolders.desktop, name);
+            await FS.createFolder(FS.specialFolders.desktop, finalName);
+            renderDesktopIcons();
+          }
         }
       },
+      ...(OS.clipboard?.fileId ? [
+        { separator: true },
+        {
+          label: 'Paste', icon: 'paste', action: async () => {
+            if (OS.settings?.get?.('disableClipboardPaste')) {
+              Notify.show({ title: 'Paste disabled', body: 'Paste disabled.', type: 'error', appName: 'Desktop' });
+              return;
+            }
+            try {
+              const clip = OS.clipboard;
+              await FS.pasteInto(clip, FS.specialFolders.desktop);
+              if (clip.type === 'cut') OS.clipboard = null;
+              renderDesktopIcons();
+            } catch (err) {
+              console.error('[Desktop] paste failed:', err);
+              Notify.show({ title: 'Paste failed', body: err?.message || 'Unknown error', type: 'error', appName: 'Desktop' });
+            }
+          }
+        }
+      ] : []),
       { separator: true },
       { label: 'Open Terminal', icon: 'terminal', action: () => WM.createWindow('shell') },
       { label: 'Open Settings', icon: 'settings', action: () => WM.createWindow('nook') },
@@ -734,7 +957,7 @@ document.addEventListener('keydown', (e) => {
   if ((e.metaKey || e.ctrlKey) && e.key === 'd')                        { e.preventDefault(); WM.minimizeAll(); }
   if (e.key === 'PrintScreen' && !e.altKey)                              { e.preventDefault(); captureScreenshot('desktop'); }
   if (e.altKey && e.key === 'PrintScreen')                               { e.preventDefault(); captureScreenshot('window'); }
-  if (e.key === 's' && (e.metaKey || e.ctrlKey) && e.shiftKey)         { e.preventDefault(); captureScreenshot('region'); }
+  if ((e.key === 's' || e.key === 'S') && (e.metaKey || e.ctrlKey) && e.shiftKey) { e.preventDefault(); captureScreenshot('region'); }
   if (e.altKey && e.key === 'F4')  { e.preventDefault(); if (OS.focusedWindowId) WM.closeWindow(OS.focusedWindowId); }
   if (e.altKey && e.key === 'Tab') { e.preventDefault(); showAppSwitcher(); }
 
@@ -749,11 +972,177 @@ document.addEventListener('keydown', (e) => {
     if (launchpad.classList.contains('active')) toggleLaunchpad();
     ContextMenu.hide();
   }
+
+  // F3 — toggle debug overlay only; devMode setting is unchanged
+  if (e.key === 'F3') {
+    e.preventDefault();
+    if (window.DebugOverlay) {
+      window.DebugOverlay.toggle();
+    }
+  }
+
+  // Ctrl+Shift+D — copy debug overlay text to clipboard
+  if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key === 'D') {
+    e.preventDefault();
+    if (window.DebugOverlay) {
+      window.DebugOverlay._copyDebugInfo?.();
+      Notify.show({ title: 'Debug Info Copied', body: 'Overlay text copied to clipboard', type: 'success' });
+    }
+  }
 });
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // SCREENSHOT
 // ═══════════════════════════════════════════════════════════════════════════════
+
+// Strips the `data:<mime>;base64,` wrapper so only the raw base64 payload is
+// stored — matches the VFS convention used for dropped/uploaded binary files
+// (see extractBase64FromDataUrl in the desktop drop handler) and what apps
+// like Gallery expect to decode.
+function _dataUrlToBase64(dataUrl) {
+  const comma = dataUrl.indexOf(',');
+  return comma > -1 ? dataUrl.slice(comma + 1) : dataUrl;
+}
+
+// Lets the user drag out a rectangle over a still image of the captured
+// frame. Resolves to {x, y, width, height} in the image's own pixel space,
+// or null if the user cancels (Escape / right-click).
+function _promptRegionSelect(frameCanvas) {
+  return new Promise((resolve) => {
+    const scale = Math.min(
+      (window.innerWidth  * 0.9) / frameCanvas.width,
+      (window.innerHeight * 0.9) / frameCanvas.height,
+      1
+    );
+    const dispW = frameCanvas.width  * scale;
+    const dispH = frameCanvas.height * scale;
+
+    const overlay = createEl('div', {
+      id: 'screenshot-region-overlay',
+      style: 'position:fixed;inset:0;background:rgba(0,0,0,0.65);display:flex;align-items:center;justify-content:center;z-index:99999;cursor:crosshair;user-select:none;'
+    });
+
+    const frame = createEl('div', {
+      style: `position:relative;width:${dispW}px;height:${dispH}px;box-shadow:0 0 0 1px rgba(255,255,255,0.2);`
+    });
+    const img = createEl('img', { style: 'width:100%;height:100%;display:block;pointer-events:none;' });
+    img.src = frameCanvas.toDataURL('image/png');
+
+    const selectionBox = createEl('div', {
+      style: 'position:absolute;border:2px solid var(--accent, #3b82f6);background:rgba(59,130,246,0.15);display:none;pointer-events:none;'
+    });
+
+    const hint = createEl('div', {
+      textContent: 'Drag to select a region · Esc to cancel',
+      style: 'position:absolute;top:-32px;left:0;color:#fff;font-size:12px;font-family:var(--font-ui, sans-serif);opacity:0.85;'
+    });
+
+    frame.append(img, selectionBox, hint);
+    overlay.appendChild(frame);
+    document.body.appendChild(overlay);
+
+    let startX = 0, startY = 0, dragging = false;
+    let settled = false;
+
+    const clamp = (v, min, max) => Math.min(Math.max(v, min), max);
+
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      document.removeEventListener('keydown', onKeyDown, true);
+      overlay.remove();
+      resolve(result);
+    };
+
+    const onPointerDown = (e) => {
+      if (e.button !== 0) return;
+      const rect = frame.getBoundingClientRect();
+      startX = clamp(e.clientX - rect.left, 0, dispW);
+      startY = clamp(e.clientY - rect.top, 0, dispH);
+      dragging = true;
+      selectionBox.style.display = 'block';
+      selectionBox.style.left = `${startX}px`;
+      selectionBox.style.top = `${startY}px`;
+      selectionBox.style.width = '0px';
+      selectionBox.style.height = '0px';
+    };
+
+    const onPointerMove = (e) => {
+      if (!dragging) return;
+      const rect = frame.getBoundingClientRect();
+      const curX = clamp(e.clientX - rect.left, 0, dispW);
+      const curY = clamp(e.clientY - rect.top, 0, dispH);
+      const left = Math.min(startX, curX), top = Math.min(startY, curY);
+      const w = Math.abs(curX - startX), h = Math.abs(curY - startY);
+      selectionBox.style.left = `${left}px`;
+      selectionBox.style.top = `${top}px`;
+      selectionBox.style.width = `${w}px`;
+      selectionBox.style.height = `${h}px`;
+    };
+
+    const onPointerUp = (e) => {
+      if (!dragging) return;
+      dragging = false;
+      const rect = frame.getBoundingClientRect();
+      const curX = clamp(e.clientX - rect.left, 0, dispW);
+      const curY = clamp(e.clientY - rect.top, 0, dispH);
+      const left = Math.min(startX, curX), top = Math.min(startY, curY);
+      const w = Math.abs(curX - startX), h = Math.abs(curY - startY);
+
+      // Too small to be an intentional selection — treat as a click, keep
+      // waiting rather than resolving with an empty region.
+      if (w < 4 || h < 4) {
+        selectionBox.style.display = 'none';
+        return;
+      }
+
+      // Map back from display space to the source frame's real pixel space.
+      finish({
+        x: Math.round(left / scale),
+        y: Math.round(top / scale),
+        width: Math.round(w / scale),
+        height: Math.round(h / scale),
+      });
+    };
+
+    const onKeyDown = (e) => {
+      if (e.key === 'Escape') { e.preventDefault(); finish(null); }
+    };
+    const onContextMenu = (e) => { e.preventDefault(); finish(null); };
+
+    overlay.addEventListener('pointerdown', onPointerDown);
+    overlay.addEventListener('pointermove', onPointerMove);
+    overlay.addEventListener('pointerup', onPointerUp);
+    overlay.addEventListener('contextmenu', onContextMenu);
+    document.addEventListener('keydown', onKeyDown, true);
+  });
+}
+
+// Finds the "Screenshots" subfolder inside Pictures, creating it once if it
+// doesn't exist yet. Cached after the first successful lookup/creation so
+// repeated screenshots don't re-scan Pictures' contents every time.
+let _screenshotsFolderId = null;
+
+async function _getOrCreateScreenshotsFolder() {
+  if (_screenshotsFolderId && FS.files.has(_screenshotsFolderId)) {
+    return _screenshotsFolderId;
+  }
+
+  const picturesId = FS.specialFolders?.pictures;
+  if (!picturesId) return null;
+
+  const existing = FS.listDir(picturesId)
+    .find(f => f.type === 'folder' && f.name === 'Screenshots');
+
+  if (existing) {
+    _screenshotsFolderId = existing.id;
+    return existing.id;
+  }
+
+  const created = await FS.createFolder(picturesId, 'Screenshots');
+  _screenshotsFolderId = created.id;
+  return created.id;
+}
 
 async function captureScreenshot(mode) {
   let stream;
@@ -767,22 +1156,54 @@ async function captureScreenshot(mode) {
     video.srcObject = stream;
     await video.play();       // #11: if this throws, finally() still stops tracks
 
-    const canvas = document.createElement('canvas');
-    canvas.width  = video.videoWidth;
-    canvas.height = video.videoHeight;
-    canvas.getContext('2d').drawImage(video, 0, 0);   // #11: same
+    const fullCanvas = document.createElement('canvas');
+    fullCanvas.width  = video.videoWidth;
+    fullCanvas.height = video.videoHeight;
+    fullCanvas.getContext('2d').drawImage(video, 0, 0);   // #11: same
 
-    const blob = await new Promise(r => canvas.toBlob(r, 'image/png'));
-    const url  = URL.createObjectURL(blob);
-    const a    = document.createElement('a');
-    a.href     = url;
-    a.download = `screenshot-${Date.now()}.png`;
-    a.click();
-    URL.revokeObjectURL(url);
+    // The stream is only needed to grab one frame — release it immediately
+    // rather than holding the screen-capture indicator open while the user
+    // drags out a region selection.
+    stream.getTracks().forEach(t => t.stop());
+    stream = null;
 
-    Notify.show({ title: 'Screenshot Saved', body: 'Screenshot captured successfully', type: 'success', appName: 'System' });
+    let outputCanvas = fullCanvas;
+
+    if (mode === 'region') {
+      const region = await _promptRegionSelect(fullCanvas);
+      if (!region) {
+        // User cancelled — not an error, just quietly stop.
+        return;
+      }
+      const cropped = document.createElement('canvas');
+      cropped.width = region.width;
+      cropped.height = region.height;
+      cropped.getContext('2d').drawImage(
+        fullCanvas,
+        region.x, region.y, region.width, region.height,
+        0, 0, region.width, region.height
+      );
+      outputCanvas = cropped;
+    }
+
+    const dataUrl = outputCanvas.toDataURL('image/png');
+    const base64  = _dataUrlToBase64(dataUrl);
+    const name    = `screenshot-${Date.now()}.png`;
+
+    const screenshotsId = await _getOrCreateScreenshotsFolder();
+    if (!screenshotsId) throw new Error('Pictures folder not found');
+
+    await FS.createFile(screenshotsId, name, base64, 'image/png');
+
+    Notify.show({ title: 'Screenshot Saved', body: `Saved to Pictures/Screenshots as ${name}`, type: 'success', appName: 'System' });
+    if (typeof EventLog !== 'undefined') {
+      EventLog.log({ app: 'System', category: 'system', severity: 'info', message: `Screenshot captured (${mode})`, data: { mode, name } });
+    }
   } catch {
     Notify.show({ title: 'Screenshot Failed', body: 'Could not capture screenshot', type: 'error', appName: 'System' });
+    if (typeof EventLog !== 'undefined') {
+      EventLog.log({ app: 'System', category: 'system', severity: 'error', message: `Screenshot capture failed (${mode})`, data: { mode } });
+    }
   } finally {
     // #11: always stop tracks — screen-capture indicator is never left dangling
     stream?.getTracks().forEach(t => t.stop());
@@ -808,6 +1229,9 @@ function switchWorkspace(direction) {
     const newWs = { id: Date.now(), name: `Workspace ${OS.workspaces.length + 1}` };
     OS.workspaces.push(newWs);
     OS.currentWorkspace = newWs.id;
+    if (typeof EventLog !== 'undefined') {
+      EventLog.log({ app: 'System', category: 'window', severity: 'info', message: `Created ${newWs.name}`, data: { workspaceId: newWs.id } });
+    }
   }
 }
 
@@ -834,7 +1258,7 @@ function showAppSwitcher() {
     if (!app) return;
     const item = createEl('div', { className: 'app-switcher-item' + (i === 0 ? ' active' : '') });
     const icon = createEl('div', { className: 'app-switcher-icon' });
-    icon.innerHTML = svgIcon(app.icon, 32);
+    icon.innerHTML = svgIcon(app.id && app.id.startsWith('webapp_') ? app.icon : (app.icon || '/assets/no_app_icon.svg'), 32);
     item.appendChild(icon);
     item.appendChild(createEl('div', { className: 'app-switcher-name', textContent: app.name }));
     list.appendChild(item);
@@ -877,6 +1301,9 @@ function lockScreen() {
   OS.isLocked = true;
   document.getElementById('lock-screen').classList.add('active');
   renderLockScreen();
+  if (typeof EventLog !== 'undefined') {
+    EventLog.log({ app: 'System', category: 'security', severity: 'info', message: 'Screen locked' });
+  }
 }
 
 function renderLockScreen() {
@@ -961,6 +1388,9 @@ let enteredPin = '';
 
 function unlockFromLockScreen() {
   OS.isLocked = false;
+  if (typeof EventLog !== 'undefined') {
+    EventLog.log({ app: 'System', category: 'security', severity: 'info', message: 'Screen unlocked' });
+  }
 
   // #4: cancel the wipe countdown — biometric auth must be able to abort it.
   // The old code stored countdownInterval in a block-local var inside verifyPin(),
@@ -1015,6 +1445,9 @@ async function verifyPin() {
     statusEl.textContent = `Locked out. Try again in ${remaining}s`;
     enteredPin = '';
     updatePinDots();
+    if (typeof EventLog !== 'undefined') {
+      EventLog.log({ app: 'System', category: 'security', severity: 'warn', message: `PIN attempt blocked — lockout active (${remaining}s remaining)` });
+    }
     return;
   }
 
@@ -1029,6 +1462,9 @@ async function verifyPin() {
     OS.wrongPinCount++;
     enteredPin = '';
     updatePinDots();
+    if (typeof EventLog !== 'undefined') {
+      EventLog.log({ app: 'System', category: 'security', severity: 'warn', message: `Incorrect PIN entered (attempt ${OS.wrongPinCount})`, data: { wrongPinCount: OS.wrongPinCount } });
+    }
 
     const THRESHOLD    = 3;
     const DURATION_MS  = 30_000;
@@ -1038,6 +1474,9 @@ async function verifyPin() {
       const label = sec >= 60 ? `${Math.round(sec / 60)}min` : `${sec}s`;
       statusEl.textContent  = `Too many attempts. ${label} lockout.`;
       OS.lockoutUntil       = Date.now() + DURATION_MS;
+      if (typeof EventLog !== 'undefined') {
+        EventLog.log({ app: 'System', category: 'security', severity: 'warn', message: `Lockout triggered (${label}) after ${OS.wrongPinCount} failed PIN attempts`, data: { wrongPinCount: OS.wrongPinCount, durationMs: DURATION_MS } });
+      }
       setTimeout(() => { OS.wrongPinCount = 0; OS.lockoutUntil = 0; statusEl.textContent = ''; }, DURATION_MS);
 
     } else if (OS.wrongPinCount >= THRESHOLD * 2 && OS.wrongPinCount < 10) {
@@ -1046,10 +1485,16 @@ async function verifyPin() {
       const label   = sec >= 60 ? `${Math.round(sec / 60)}min` : `${sec}s`;
       statusEl.textContent = `Too many attempts. ${label} lockout.`;
       OS.lockoutUntil      = Date.now() + longDur;
+      if (typeof EventLog !== 'undefined') {
+        EventLog.log({ app: 'System', category: 'security', severity: 'warn', message: `Extended lockout triggered (${label}) after ${OS.wrongPinCount} failed PIN attempts`, data: { wrongPinCount: OS.wrongPinCount, durationMs: longDur } });
+      }
       setTimeout(() => { OS.wrongPinCount = 0; OS.lockoutUntil = 0; statusEl.textContent = ''; }, longDur);
 
     } else if (OS.wrongPinCount >= 10) {
       statusEl.textContent = 'Security alert! Data will be wiped.';
+      if (typeof EventLog !== 'undefined') {
+        EventLog.log({ app: 'System', category: 'security', severity: 'error', message: `Security wipe countdown started after ${OS.wrongPinCount} failed PIN attempts`, data: { wrongPinCount: OS.wrongPinCount } });
+      }
       let countdown = 10;
       // #4: store at module scope so unlockFromLockScreen() can cancel it
       _wipeCountdownId = setInterval(() => {
@@ -1060,6 +1505,9 @@ async function verifyPin() {
           _wipeCountdownId = 0;
           localStorage.clear();
           sessionStorage.clear();
+          if (typeof EventLog !== 'undefined') {
+            EventLog.log({ app: 'System', category: 'security', severity: 'error', message: 'Security wipe executed — all local data cleared' });
+          }
           Notify.show({
             title: 'Security Wipe',
             body: 'All data has been wiped due to too many failed attempts.',
@@ -1158,7 +1606,11 @@ function triggerRecovery(reason) {
   if (attempts.length > 10) attempts.shift();
   localStorage.setItem(KEY, JSON.stringify(attempts));
 
-  if (attempts.length >= 2) { showRecoveryScreen(attempts); return true; }
+  if (typeof EventLog !== 'undefined') {
+    EventLog.log({ app: 'System', category: 'system', severity: 'error', message: `Boot failure detected: ${reason || 'unknown'} (attempt ${attempts.length})`, data: { reason, attemptCount: attempts.length } });
+  }
+
+  if (attempts.length >= 2) { showRecoveryScreen(attempts, false); return true; }
   return false;
 }
 
@@ -1177,7 +1629,7 @@ window.addEventListener('error', (e) => {
   }
 });
 
-function showRecoveryScreen(priorAttempts) {
+function showRecoveryScreen(priorAttempts, isManual) {
   const bootScreen = document.getElementById('boot-screen');
   if (bootScreen) bootScreen.style.display = 'none';
 
@@ -1200,7 +1652,7 @@ function showRecoveryScreen(priorAttempts) {
         </div>
       </div>
       <div class="rba-title">NovaByte</div>
-      <div class="rba-subtitle">⚠ Recovery Mode v2.0</div>
+      <div class="rba-subtitle">⚠ Recovery Mode</div>
       <div class="rba-log" id="rba-log"></div>
       <div class="rba-bar-wrap"><div class="rba-bar" id="rba-bar"></div></div>
       <div class="rba-status" id="rba-status">Initializing recovery environment…</div>
@@ -1212,9 +1664,16 @@ function showRecoveryScreen(priorAttempts) {
   const rbaStatus = document.getElementById('rba-status');
   let step = 0;
 
-  const steps = [
+  const steps = isManual ? [
+    { msg: '[ RECOVERY MODE ]',                            cls: 'info', pct: 8,   label: 'Loading recovery kernel…'   },
+    { msg: '✓ Recovery environment loaded',          cls: 'ok',   pct: 22,  label: 'Mounting storage…'          },
+    { msg: '✓ localStorage integrity check…',             cls: 'ok',   pct: 38,  label: 'Checking data…'             },
+    { msg: 'Entering recovery — requested manually',       cls: 'info', pct: 60,  label: 'Preparing interface…'       },
+    { msg: '✓ Recovery UI ready',                         cls: 'ok',   pct: 88,  label: 'Almost ready…'              },
+    { msg: '✓ Handoff to Recovery Environment',           cls: 'info', pct: 100, label: 'Done.'                      },
+  ] : [
     { msg: '[ RECOVERY MODE TRIGGERED ]',                 cls: 'warn', pct: 8,   label: 'Loading recovery kernel…'   },
-    { msg: '✓ Recovery environment v2.0 loaded',          cls: 'ok',   pct: 22,  label: 'Mounting storage…'          },
+    { msg: '✓ Recovery environment loaded',          cls: 'ok',   pct: 22,  label: 'Mounting storage…'          },
     { msg: '✓ localStorage integrity check…',             cls: 'ok',   pct: 38,  label: 'Checking data…'             },
     { msg: '⚠ Boot failure detected — entering recovery', cls: 'warn', pct: 60,  label: 'Preparing interface…'       },
     { msg: '✓ Recovery UI ready',                         cls: 'ok',   pct: 88,  label: 'Almost ready…'              },
@@ -1226,7 +1685,7 @@ function showRecoveryScreen(priorAttempts) {
       setTimeout(() => {
         anim.classList.add('fade-out');
         setTimeout(() => { anim.remove(); }, 650);
-        _doShowRecoveryScreen(priorAttempts);
+        _doShowRecoveryScreen(priorAttempts, isManual);
       }, 300);
       return;
     }
@@ -1243,7 +1702,7 @@ function showRecoveryScreen(priorAttempts) {
   setTimeout(runStep, 180);
 }
 
-function _doShowRecoveryScreen(priorAttempts) {
+function _doShowRecoveryScreen(priorAttempts, isManual) {
   // #20: The original wireRecoveryControls() used the bare name `screen` which
   // resolved to window.screen (the global Screen object, not a DOM element).
   // We now look up the element here and pass it explicitly.
@@ -1251,13 +1710,12 @@ function _doShowRecoveryScreen(priorAttempts) {
   if (!recoveryScreenEl) return;
   recoveryScreenEl.classList.add('active');
 
-  const isManual =
-    localStorage.getItem('nova_manual_recovery') === '1' ||
-    localStorage.getItem('nova_show_recovery')   === '1';
-  if (isManual) {
-    localStorage.removeItem('nova_manual_recovery');
-    localStorage.removeItem('nova_show_recovery');
-  }
+  // isManual is passed in explicitly from showRecoveryScreen(), since by the
+  // time this runs, boot.js has already cleared nova_manual_recovery and
+  // nova_show_recovery (it clears them before calling showRecoveryScreen at
+  // all) — re-reading those flags here always returned false, which is why
+  // the manual-recovery banner/log treatment was never actually applying.
+  isManual = !!isManual;
 
   const attemptCountEl = document.getElementById('rec-attempt-count');
   const attemptAlertEl = document.querySelector('.recovery-alert');
@@ -1594,4 +2052,12 @@ function launchSnakeGame() {
   svc.__patchedStartup = true;
   try { svc.ensureBooted?.(); } catch { }
 })();
+
+OS.events.on('settings:changed', ({ key }) => {
+  if (key === 'devMode') {
+    if (document.getElementById('launchpad')?.classList.contains('active')) renderLaunchpad();
+    if (typeof WM !== 'undefined' && WM.updateTaskbar) WM.updateTaskbar();
+  }
+});
+
 boot();

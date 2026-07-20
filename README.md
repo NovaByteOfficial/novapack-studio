@@ -2,20 +2,20 @@
 
 <div><img src="./logo.svg" width="100" height="100" alt="NovaByte Logo" /></div>
 
-<div><img src="https://img.shields.io/badge/NovaByte_Studio-v1.1.61-22c55e?style=for-the-badge" alt="NovaByte Studio"/></div>
+<div><img src="https://img.shields.io/badge/NovaByte_Studio-v1.1.70-22c55e?style=for-the-badge" alt="NovaByte Studio"/></div>
 
 # NovaByte Studio
 
 **A desktop IDE for building and packaging `.novaapp` applications —**
-**compatible with every NBOSP fork and NovaByte OS v3.**
+**compatible with every NBOSP fork and [NovaByte OS v3](https://github.com/NovaByteTeam/novabyte-os).**
 
 <br>
 
-[![NBOSP Compatible](https://img.shields.io/badge/NBOSP-Compatible-22c55e?style=flat-square)](https://github.com/NovaByteTeam/novabyte-os)
+[![NBOSP Compatible](https://img.shields.io/badge/NBOSP-Compatible-22c55e?style=flat-square)](https://github.com/NovaByteOfficial/novapack-studio)
 [![v3 Compatible](https://img.shields.io/badge/NovaByte_OS-v3.x.x-22c55e?style=flat-square)](https://github.com/NovaByteTeam/novabyte-os)
 [![Node](https://img.shields.io/badge/Node.js-22+-339933?style=flat-square&logo=node.js&logoColor=white)](https://nodejs.org)
 [![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux%20%7C%20macOS-22c55e?style=flat-square)](#)
-[![Downloads](https://img.shields.io/badge/Download-Releases-22c55e?style=flat-square)](https://github.com/NovaByteTeam/novabyte-studio/releases)
+[![Downloads](https://img.shields.io/badge/Download-Releases-22c55e?style=flat-square)](https://github.com/NovaByteOfficial/novapack-studio/releases)
 [![License](https://img.shields.io/badge/License-All_Rights_Reserved-22c55e?style=flat-square)](#license)
 
 <br>
@@ -36,7 +36,7 @@ Apps you build with Studio run on NovaByte OS v3 and every NBOSP fork. The `.nov
 
 ## Download
 
-NovaByte Studio is available for Windows, macOS, and Linux. Download the latest release for your platform from the [Releases](https://github.com/NovaByteTeam/novabyte-studio/releases) page, extract the archive, and run the executable — no install required.
+NovaByte Studio is available for Windows, macOS, and Linux. Download the latest release for your platform from the [Releases](https://github.com/NovaByteOfficial/novapack-studio/releases) page, extract the archive, and run the executable — no install required.
 
 ---
 
@@ -51,13 +51,14 @@ NovaByte Studio is available for Windows, macOS, and Linux. Download the latest 
 | Template | Description |
 |----------|-------------|
 | `blank` | Empty shell — start from scratch |
-| `webapp` | External URL wrapper |
+| `webapp` | Pins one external site as its own app — fixed URL, no address bar or navigation |
+| `browser` | URL bar with back, forward, and reload — a real navigable browser view |
 | `utility` | File-access tool with fs permission wiring |
-| `game` | Canvas game skeleton with game loop |
+| `game` | Game loop skeleton with canvas rendering |
 | `dashboard` | Data widget grid with live update pattern |
-| `form` | Data entry form with local JSON persistence |
-| `markdown-viewer` | Live markdown preview with vendor library support |
-| `chat` | Message list UI — client-side state, no permissions needed |
+| `form` | Structured form that saves entries via the fs bridge |
+| `markdown-viewer` | Live markdown preview using a bundled vendor library |
+| `chat` | Message list with input — client-side state, no permissions needed |
 
 ### Bundled external dependencies (`vendor/`)
 
@@ -181,21 +182,29 @@ NovaByte Studio includes a full-featured CodeMirror 6 editor with:
 
 - **Multi-tab editing** — VS Code-style pinned/preview tabs with dirty indicators
 - **Syntax highlighting** — JavaScript, TypeScript, HTML, CSS, JSON, Markdown and more
-- **TypeScript intellisense** — in-process type-aware completion, hover, and linting via `@typescript/vfs` (no server required)
+- **TypeScript intellisense** — in-process type-aware completion and linting via `@typescript/vfs` (no server required)
 - **Find / Replace** — search panel with next/previous/replace/replace-all
-- **Diff / merge view** — side-by-side file comparison
+- **Diff / merge view** — side-by-side file comparison, including unsaved changes vs disk
 - **Image preview** — inline preview for PNG, JPG, SVG, WebP, ICO
+- **HTML Preview** — split-pane live preview for HTML files with `<base>` injection for relative URLs
 - **Settings** — configurable font size, tab size, and word wrap, persisted per-user
-- **Git integration** — file tree badges for modified, added, deleted, and untracked files
+- **Git integration** — file tree badges for modified, added, deleted, and untracked files; branch switching and commit panel
 - **Context menu** — rename, duplicate, delete, new file/folder, compare files
 - **Command palette** — quick access to every action (`Ctrl+Shift+P`)
 - **Quick open** — jump to any file (`Ctrl+P`)
-- **Global search** — search across all files in the project
+- **Global search** — search across all files in the project with match highlighting
 - **Workspaces** — save and restore open file sets per project
+- **Build history** — persisted build log with success/failure status, timestamps, and re-run
+- **Syntax check** — esbuild-powered JS syntax validation with line-precise error reporting
+- **Package Inspector** — drop a `.novaapp` to inspect manifest, files, signature validity, and permission audit (declared vs detected `nova:*` actions)
+- **Update checker** — GitHub Releases API integration with semver badge and changelog modal
+- **Resizable file tree rail** — drag to resize, collapse/expand, persisted width
+- **Pinned recent projects** — pin frequently-used projects to the top of the recents list
+- **Submission Queue** — track Trusted Signing submissions with pending/approved/rejected status
 
 ### Themes
 
-Seven built-in themes: NovaByte Dark, NovaByte Light, Midnight Blue, Amber, Nightshade, High Contrast, and Forest.
+Eight total themes: seven built-in presets — NovaByte Dark, NovaByte Light, Midnight Blue, Amber, Nightshade, High Contrast, and Forest — plus a fully custom theme editor with per-CSS-variable color pickers and JSON import/export.
 
 ---
 

@@ -28,7 +28,7 @@ function setupMiddleware(app) {
             directives: {
                 defaultSrc: ["'self'"],
                 scriptSrc: ["'self'", "'unsafe-inline'", "'unsafe-eval'", 'https://cdnjs.cloudflare.com', 'https://cdn.jsdelivr.net'],
-                scriptSrcElem: ["'self'", "'unsafe-inline'", "'unsafe-eval'", 'https://cdnjs.cloudflare.com', 'https://cdn.jsdelivr.net', 'https://localhost:3003', 'https://127.0.0.1:3003'],
+                scriptSrcElem: ["'self'", "'unsafe-inline'", "'unsafe-eval'", 'blob:', 'https://cdnjs.cloudflare.com', 'https://cdn.jsdelivr.net', 'https://localhost:3003', 'https://127.0.0.1:3003'],
                 styleSrc: ["'self'", "'unsafe-inline'", 'https://cdnjs.cloudflare.com', 'https://fonts.googleapis.com'],
                 styleSrcElem: ["'self'", "'unsafe-inline'", 'https://cdnjs.cloudflare.com', 'https://fonts.googleapis.com'],
                 scriptSrcAttr: ["'unsafe-inline'"],
@@ -95,11 +95,8 @@ function setupMiddleware(app) {
             if (req.path.startsWith('/public/')) return true;
             if (req.path.startsWith('/assets/')) return true;
             if (req.path === '/favicon.ico') return true;
-            // These have their own dedicated limiters and fire many times per email/page load
-            if (req.path === '/api/email-image') return true;
+            // Has its own dedicated limiter and fires many times per page load
             if (req.path === '/api/favicon') return true;
-            // Suggest fires on every keystroke; has its own suggestLimiter (120/min)
-            if (req.path === '/api/suggest') return true;
             return false;
         }
     });
@@ -188,6 +185,32 @@ function setupMiddleware(app) {
             maxAge: 24 * 60 * 60 * 1000 // 24 hours
         }
     }));
+
+    // Populate req.user for the local single-user OS. There's no login/
+    // account system anywhere in this codebase — req.user was previously
+    // never assigned at all, which meant every `req.user?.role === 'admin'`
+    // check in security/routes.js was permanently false, and every
+    // `req.user?.id` was permanently undefined. This derives an identity
+    // from the existing Express session (already persisted via SqliteStore
+    // above) plus the local admin-state flag, so those checks mean
+    // something real instead of being dead branches.
+    const { isAdminEnabled } = require('./security/admin-state');
+    app.use((req, res, next) => {
+        req.user = {
+            id: req.sessionID,
+            role: isAdminEnabled() ? 'admin' : 'user'
+        };
+        // Stamped onto the session itself (not just req.user) so the
+        // /api/security/sessions listing — which reads the SQLite session
+        // store directly, not live request objects — can show which
+        // role/IP/UA each stored session belongs to.
+        if (req.session) {
+            req.session.user = req.user;
+            req.session.lastIp = req.ip;
+            req.session.lastUserAgent = req.get('user-agent') || null;
+        }
+        next();
+    });
 
     // Apply security middleware from security-middleware.js if available
     try {

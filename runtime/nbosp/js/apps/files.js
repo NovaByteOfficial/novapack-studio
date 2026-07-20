@@ -59,6 +59,13 @@
     return !ILLEGAL_NAME_RE.test(trimmed);
   }
 
+  // Thin wrapper kept for call-site readability; the actual logic lives on
+  // FS (js/core/services/fs.js) so it can be shared with non-Files-app
+  // callers like the desktop's empty-area "New File"/"New Folder" menu.
+  function uniqueNameFor(destParentId, name, excludeId) {
+    return FS.uniqueName(destParentId, name, excludeId);
+  }
+
   function mimeToTypeLabel(mimeType) {
     if (!mimeType) return 'FILE';
     const sub = mimeType.split('/')[1];
@@ -235,7 +242,16 @@
         'aria-label': 'Search files',
       });
 
-      toolbar.append(this.backBtn, this.upBtn, pathBarWrap, this.searchInput);
+      // Empty Trash: only shown while browsing the Trash folder itself.
+      this.emptyTrashBtn = createEl('button', {
+        className: 'browser-nav-btn',
+        title: 'Empty Trash',
+        'aria-label': 'Empty Trash',
+        style: 'display:none;',
+      });
+      this.emptyTrashBtn.innerHTML = svgIcon('trash', 16);
+
+      toolbar.append(this.backBtn, this.upBtn, pathBarWrap, this.searchInput, this.emptyTrashBtn);
       root.appendChild(toolbar);
 
       // Files area: icon view + list view (only one visible at a time)
@@ -282,6 +298,7 @@
     wireToolbar() {
       this.backBtn.addEventListener('click', () => this.goBack(), { signal: this.signal });
       this.upBtn.addEventListener('click', () => this.goUp(), { signal: this.signal });
+      this.emptyTrashBtn.addEventListener('click', () => this.emptyTrash(), { signal: this.signal });
 
       this.pathBar.addEventListener('keydown', (e) => {
         if (e.key === 'Enter') {
@@ -497,6 +514,21 @@
       this.updateSelectionVisuals();
     }
 
+    // Resolve the icon to show for a file. App-shortcut .lnk files store the
+    // pinned app's icon in their JSON content (see desktop.js), so use that
+    // instead of FS.getMimeIcon(), which has no case for
+    // 'application/x-app-shortcut' and would otherwise fall back to the
+    // generic file icon for every shortcut.
+    resolveFileIcon(f) {
+      if (f.name?.endsWith('.lnk') && f.mimeType === 'application/x-app-shortcut') {
+        try {
+          const data = JSON.parse(f.content);
+          if (data?.type === 'app-shortcut' && data.icon) return data.icon;
+        } catch { /* not a valid shortcut, fall through to mime icon */ }
+      }
+      return FS.getMimeIcon(f.mimeType, f.name);
+    }
+
     // Icon view
     renderFileList(files) {
       this.filesGrid.replaceChildren();
@@ -520,7 +552,7 @@
         item._fileNode = f;
 
         const iconDiv = createEl('div', { className: 'vault-file-icon', style: 'position:relative;' });
-        iconDiv.innerHTML = svgIcon(f.type === 'folder' ? 'folder' : FS.getMimeIcon(f.mimeType, f.name), 36);
+        iconDiv.innerHTML = svgIcon(f.type === 'folder' ? 'folder' : this.resolveFileIcon(f), 36);
         const tag = f.tags?.[0];
         if (tag) {
           const token = TAG_COLOR_TOKEN[tag] || 'text-warning';
@@ -552,7 +584,7 @@
 
         const nameCell = createEl('div', { style: 'display:flex;align-items:center;gap:8px;padding:6px 12px;min-width:0;' });
         const ic = createEl('span', { style: 'flex-shrink:0;color:var(--text-muted);' });
-        ic.innerHTML = svgIcon(f.type === 'folder' ? 'folder' : FS.getMimeIcon(f.mimeType, f.name), 16);
+        ic.innerHTML = svgIcon(f.type === 'folder' ? 'folder' : this.resolveFileIcon(f), 16);
         const nm = createEl('span', {
           className: 'vault-list-row-name',
           style: 'font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;',
@@ -661,6 +693,10 @@
       }
       this.currentFilesCache = this.sortFiles(files);
 
+      const inTrash = this.nav.cwd === FS.specialFolders.trash;
+      this.emptyTrashBtn.style.display = inTrash ? '' : 'none';
+      if (inTrash) this.emptyTrashBtn.disabled = FS.listDir(this.nav.cwd).length === 0;
+
       this.filesGrid.style.display = this.viewMode === 'icon' ? 'grid' : 'none';
       this.listView.style.display = this.viewMode === 'list' ? 'flex' : 'none';
 
@@ -685,7 +721,7 @@
       }
       items.push({ separator: true });
       items.push({
-        label: 'Rename', icon: 'file-text', shortcut: 'F2',
+         label: 'Rename', icon: 'rename', shortcut: 'F2',
         action: () => this.startRename(f),
       });
       items.push({
@@ -834,6 +870,31 @@
       }
     }
 
+    // Empty Trash: permanently deletes everything currently in the Trash
+    // folder. Only reachable via the toolbar button, which is only shown
+    // while the Trash folder itself is open.
+    async emptyTrash() {
+      if (isViewOnly()) {
+        notifyBlocked('Delete disabled.');
+        return;
+      }
+      const ok = await showModal(
+        'Empty Trash',
+        'All items in Trash will be permanently deleted. This cannot be undone.',
+        [{ label: 'Cancel' }, { label: 'Empty Trash', style: 'danger' }]
+      );
+      if (ok !== 'Empty Trash') return;
+      try {
+        await FS.emptyTrash();
+        this.selectedIds.clear();
+        this.renderFiles();
+        if (typeof renderDesktopIcons === 'function') renderDesktopIcons();
+      } catch (err) {
+        console.error('[Files] empty trash failed:', err);
+        notifyError('Empty Trash failed', err);
+      }
+    }
+
     // Move the current selection (plus the optional context-clicked file) to
     // trash. Sequential await avoids races against the trash worker; if any
     // item fails we abort and surface the error.
@@ -892,8 +953,9 @@
         return;
       }
       try {
-        if (isFile) await FS.createFile(this.nav.cwd, name, '', 'text/plain');
-        else await FS.createFolder(this.nav.cwd, name);
+        const finalName = uniqueNameFor(this.nav.cwd, name);
+        if (isFile) await FS.createFile(this.nav.cwd, finalName, '', 'text/plain');
+        else await FS.createFolder(this.nav.cwd, finalName);
         this.renderFiles();
         if (typeof renderDesktopIcons === 'function') renderDesktopIcons();
       } catch (err) {
@@ -909,26 +971,11 @@
       }
       const clip = OS.clipboard;
       if (!clip?.fileId) return;
-      const src = FS.files.get(clip.fileId);
-      if (!src) return;
       try {
+        await FS.pasteInto(clip, this.nav.cwd);
         if (clip.type === 'cut') {
-          // Move: persist first, roll back on failure so in-memory state
-          // matches storage.
-          const originalParentId = src.parentId;
-          src.parentId = this.nav.cwd;
-          try {
-            FS.files.set(src.id, src);
-            await OS.workers.fs.call('putFiles', [src]);
-          } catch (err) {
-            src.parentId = originalParentId;
-            FS.files.set(src.id, src);
-            throw err;
-          }
           OS.clipboard = null;
           this.clipboardOp = null;
-        } else {
-          await FS.createFile(this.nav.cwd, src.name, src.content, src.mimeType);
         }
         this.renderFiles();
         if (typeof renderDesktopIcons === 'function') renderDesktopIcons();
@@ -1003,6 +1050,7 @@
   registerApp({
     id: 'vault',
     name: 'Files',
+    version: '3.0.2',
     icon: 'folder-open',
     description: 'File Manager',
     defaultSize: [780, 520],
@@ -1016,6 +1064,19 @@
       if (!file || typeof file.name !== 'string') {
         Notify.show({ title: 'Error', body: 'Invalid file dropped.', type: 'error', appName: 'Files' });
         return;
+      }
+      if (window.Scanner) {
+        let verdict;
+        try {
+          verdict = await window.Scanner.scan(file);
+        } catch (err) {
+          console.warn('[Files] Scanner error:', err);
+          verdict = { safe: false, reason: `Could not verify "${file.name}" — dropped in a safe state and skipped.` };
+        }
+        if (!verdict.safe) {
+          Notify.show({ title: 'File Blocked', body: verdict.reason, type: 'error', appName: 'Security' });
+          return;
+        }
       }
       try {
         const fileId = generateId();

@@ -1,4 +1,3 @@
-
 /**
  * NovaByte - My Apps Manager
  * ────────────────────────────────────────────────────────────
@@ -82,6 +81,9 @@ const MyAppsManager = (() => {
       return app;
     } catch (error) {
       console.error('[MyAppsManager] Failed to add app:', error);
+      if (typeof EventLog !== 'undefined') {
+        EventLog.log({ app: 'MyAppsManager', category: 'apps', severity: 'error', message: `Failed to add app: ${error?.message || error}` });
+      }
       throw error;
     }
   }
@@ -91,11 +93,35 @@ const MyAppsManager = (() => {
    * @param {string} appId - App ID
    * @returns {boolean} Success
    */
-  function removeApp(appId) {
+  async function removeApp(appId) {
     try {
+      if (typeof WM !== 'undefined' && WM.closeWindow && typeof OS !== 'undefined' && OS.windows) {
+        const openWindowIds = [];
+        for (const [wid, wstate] of OS.windows) {
+          if (wstate.appId === appId) openWindowIds.push(wid);
+        }
+        await Promise.all(openWindowIds.map(wid => WM.closeWindow(wid)));
+      }
+      try {
+        if (typeof AppSandbox !== 'undefined' && AppSandbox.clearAppPartition) {
+          await AppSandbox.clearAppPartition(appId);
+        }
+      } catch (err) {
+        console.warn('[MyAppsManager] Failed to clear storage partition for', appId, err);
+      }
+      try {
+        if (typeof AppDirs !== 'undefined' && AppDirs.removeAppData) {
+          await AppDirs.removeAppData(appId);
+        }
+      } catch (err) {
+        console.warn('[MyAppsManager] Failed to clear app data for', appId, err);
+      }
       return AppRegistry?.unregisterApp(appId) || false;
     } catch (error) {
       console.error('[MyAppsManager] Failed to remove app:', error);
+      if (typeof EventLog !== 'undefined') {
+        EventLog.log({ app: 'MyAppsManager', category: 'apps', severity: 'error', message: `Failed to remove app ${appId}: ${error?.message || error}`, data: { appId } });
+      }
       return false;
     }
   }
@@ -150,6 +176,9 @@ const MyAppsManager = (() => {
       return { app };
     } catch (error) {
       console.error('[MyAppsManager] Failed to launch app:', error);
+      if (typeof EventLog !== 'undefined') {
+        EventLog.log({ app: 'MyAppsManager', category: 'apps', severity: 'error', message: `Failed to launch ${appId}: ${error?.message || error}`, data: { appId } });
+      }
       throw error;
     }
   }
@@ -178,10 +207,18 @@ const MyAppsManager = (() => {
         throw new Error('Invalid package format');
       }
 
-      const result = AppPackage?.installPackage(pkg, options);
+      const mergedOptions = {
+        trustStore: (typeof TrustStore !== 'undefined' && TrustStore.list) ? TrustStore.list() : [],
+        revocationCheck: (typeof TrustStore !== 'undefined' && TrustStore.isRevoked) ? TrustStore.isRevoked : undefined,
+        ...options,
+      };
+      const result = AppPackage?.installPackage(pkg, mergedOptions);
       return result;
     } catch (error) {
       console.error('[MyAppsManager] Installation failed:', error);
+      if (typeof EventLog !== 'undefined') {
+        EventLog.log({ app: 'MyAppsManager', category: 'apps', severity: 'error', message: `Install from file failed: ${error?.message || error}` });
+      }
       throw error;
     }
   }
@@ -200,10 +237,18 @@ const MyAppsManager = (() => {
       }
 
       const pkg = await response.json();
-      const result = AppPackage?.installPackage(pkg, options);
+      const mergedOptions = {
+        trustStore: (typeof TrustStore !== 'undefined' && TrustStore.list) ? TrustStore.list() : [],
+        revocationCheck: (typeof TrustStore !== 'undefined' && TrustStore.isRevoked) ? TrustStore.isRevoked : undefined,
+        ...options,
+      };
+      const result = AppPackage?.installPackage(pkg, mergedOptions);
       return result;
     } catch (error) {
       console.error('[MyAppsManager] Installation from URL failed:', error);
+      if (typeof EventLog !== 'undefined') {
+        EventLog.log({ app: 'MyAppsManager', category: 'apps', severity: 'error', message: `Install from URL failed: ${error?.message || error}`, data: { url } });
+      }
       throw error;
     }
   }
@@ -464,10 +509,15 @@ const MyAppsManager = (() => {
     });
 
     container.querySelectorAll('.uninstall-app-btn').forEach(btn => {
-      btn.addEventListener('click', (e) => {
+      btn.addEventListener('click', async (e) => {
         const appId = e.target.dataset.appId;
-        if (confirm(`Uninstall ${MyAppsManager.getApp(appId)?.name}?`)) {
-          MyAppsManager.removeApp(appId);
+        const uninstallResult = await showModal(
+          'Uninstall App',
+          `Uninstall ${MyAppsManager.getApp(appId)?.name}?`,
+          [{ label: 'Cancel' }, { label: 'Uninstall', value: 'confirm', danger: true }]
+        );
+        if (uninstallResult === 'confirm') {
+          await MyAppsManager.removeApp(appId);
           MyAppsManager.showAppList(container);
         }
       });
@@ -585,9 +635,14 @@ const MyAppsManager = (() => {
       MyAppsManager.launchApp(appId);
     });
 
-    container.querySelector('#uninstallAppBtn').addEventListener('click', () => {
-      if (confirm(`Uninstall ${app.name}?`)) {
-        MyAppsManager.removeApp(appId);
+    container.querySelector('#uninstallAppBtn').addEventListener('click', async () => {
+      const uninstallResult = await showModal(
+        'Uninstall App',
+        `Uninstall ${app.name}?`,
+        [{ label: 'Cancel' }, { label: 'Uninstall', value: 'confirm', danger: true }]
+      );
+      if (uninstallResult === 'confirm') {
+        await MyAppsManager.removeApp(appId);
         MyAppsManager.showAppList(container);
       }
     });

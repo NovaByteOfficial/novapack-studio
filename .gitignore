@@ -1,7 +1,6 @@
 # Source — not public
 src/
 index.html
-studio-inject.js
 build.mjs
 
 # Dependencies

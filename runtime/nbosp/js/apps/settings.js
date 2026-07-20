@@ -1,5 +1,6 @@
 registerApp({
   id: 'nook', name: 'Settings', icon: 'settings',
+  version: '3.0.2',
   description: 'System Settings',
   defaultSize: [700, 500], minSize: [500, 400],
   init(content, state, options) {
@@ -17,6 +18,7 @@ registerApp({
       { id: 'accessibility', name: 'Accessibility', icon: 'eye'       },
       { id: 'desktop',       name: 'Desktop',       icon: 'layers'    },
       { id: 'system',        name: 'System',        icon: 'processor' },
+      { id: 'date-and-region', name: 'Date and Region', icon: 'calendar' },
       { id: 'storage',       name: 'Storage',       icon: 'database'  },
       { id: 'privacy',       name: 'Privacy',       icon: 'lock'      },
       { id: 'apps',          name: 'Apps',          icon: 'package'   },
@@ -68,7 +70,7 @@ registerApp({
     ];
 
     const PERM_LABELS = {
-      'fs:read': 'Read files', 'fs:write': 'Write files', 'fs:delete': 'Delete files', 'fs:metadata': 'File metadata',
+      'vfs:read': 'Read files', 'vfs:write': 'Write files', 'vfs:delete': 'Delete files', 'vfs:metadata': 'File metadata',
       'net:internal': 'Internal network', 'net:external': 'External network', 'net:websocket': 'WebSocket',
       'mail:read': 'Read emails', 'mail:write': 'Compose emails', 'mail:send': 'Send emails', 'mail:delete': 'Delete emails',
       'calendar:read': 'Read calendar', 'calendar:write': 'Edit calendar', 'calendar:delete': 'Delete events',
@@ -76,8 +78,8 @@ registerApp({
       'device:camera': 'Camera', 'device:microphone': 'Microphone',
       'device:geolocation': 'Location', 'device:notifications': 'Notifications',
       'system:info': 'System info', 'system:settings': 'System settings', 'system:apps': 'Manage apps',
-      'admin:system': 'System administration', 'admin:users': 'Manage users', 'admin:audit': 'Audit logs',
-      'data:export': 'Export data', 'data:backup': 'Backup data',
+      'system:background': 'Background tasks', 'system:background:live': 'Keep running in background', 'system:autostart': 'Start at launch',
+      'admin:apps': 'Manage apps (admin)', 'admin:system': 'System administration', 'admin:users': 'Manage users', 'admin:audit': 'Audit logs',
     };
     const RISK_COLOR = { low: '#3fb950', medium: '#d29922', high: '#f0883e', critical: '#f85149' };
     const RISK_BG    = { low: 'rgba(63,185,80,0.1)', medium: 'rgba(210,153,34,0.1)', high: 'rgba(240,136,62,0.1)', critical: 'rgba(248,81,73,0.1)' };
@@ -127,6 +129,7 @@ registerApp({
         case 'appearance':    renderAppearance();    break;
         case 'accessibility': renderAccessibility(); break;
         case 'system':        renderSystem();        break;
+        case 'date-and-region': renderDateAndRegion(); break;
         case 'storage':       renderStorage();       break;
         case 'shortcuts':     renderShortcuts();     break;
         case 'privacy':       renderPrivacy();       break;
@@ -332,22 +335,939 @@ registerApp({
       const recoveryRow = createEl('div', { className: 'nook-row' });
       recoveryRow.appendChild(createEl('span', { className: 'nook-row-label', textContent: 'Recovery Environment' }));
       const recoveryBtn = createEl('button', { className: 'btn btn-sm', textContent: 'Boot to Recovery', style: { background: '#6c5ce7' } });
-      recoveryBtn.addEventListener('click', () => {
-        const confirmed = confirm('Boot to Recovery Environment?\n\nThis will restart and show the recovery options screen.');
-        if (!confirmed) return;
-        // Set manual recovery flag so recovery screen knows this is intentional
+      recoveryBtn.addEventListener('click', async () => {
+        const confirmed = await showModal(
+          'Boot to Recovery Environment',
+          'This will restart and show the recovery options screen.',
+          [{ label: 'Cancel' }, { label: 'Boot to Recovery', value: 'confirm', primary: true }]
+        );
+        if (confirmed !== 'confirm') return;
+        // Set manual recovery flag so recovery screen knows this is intentional.
+        // (init.js's manual-recovery branch only checks this flag and always
+        // clears nova_boot_attempts itself, so we don't need to write fake
+        // boot-attempt entries here — they'd just get deleted immediately.)
         localStorage.setItem('nova_manual_recovery', '1');
-        // Set enough boot attempts to trigger recovery (threshold is 2) but mark as intentional
-        localStorage.setItem('nova_boot_attempts', JSON.stringify([
-          { ts: Date.now() - 1000, reason: 'manual_recovery_intentional', ua: navigator.userAgent.slice(0, 80) },
-          { ts: Date.now(),         reason: 'manual_recovery_intentional', ua: navigator.userAgent.slice(0, 80) }
-        ]));
         localStorage.removeItem('nova_safe_mode');
         location.reload();
       });
       recoveryRow.appendChild(recoveryBtn);
       recoveryGroup.appendChild(recoveryRow);
       mainContent.appendChild(recoveryGroup);
+
+      // Developer Mode
+      const devGroup = createEl('div', { className: 'nook-group' });
+      devGroup.appendChild(createEl('div', { className: 'nook-group-title', textContent: 'Developer' }));
+      const devRow = createEl('div', { className: 'nook-toggle-row' });
+      devRow.appendChild(createEl('span', { textContent: 'Developer Mode' }));
+      const devToggle = createEl('button', {
+        className: 'toggle' + (OS.settings.get('devMode') ? ' active' : '')
+      });
+      devToggle.addEventListener('click', async () => {
+        const next = !OS.settings.get('devMode');
+        if (next) {
+          const confirmed = await new Promise((resolve) => {
+            const overlay = createEl('div', {
+              style: 'position:fixed;inset:0;z-index:99001;background:rgba(0,0,0,0.45);backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);display:flex;align-items:center;justify-content:center;animation:fadeIn 150ms ease;'
+            });
+            const dialog = createEl('div', {
+              style: 'background:var(--bg-elevated,#1b1f23);border:1px solid var(--text-danger,#f85149);border-radius:12px;box-shadow:0 20px 60px rgba(0,0,0,0.5), 0 0 0 1px rgba(248,81,73,0.25);padding:28px;max-width:520px;width:92%;animation:modalIn 200ms ease-out;'
+            });
+
+            const header = createEl('div', {
+              style: 'display:flex;align-items:center;gap:12px;margin-bottom:16px;'
+            });
+            const icon = createEl('span', {
+              textContent: '⚠️',
+              style: 'font-size:22px;line-height:1;'
+            });
+            const title = createEl('div', {
+              textContent: 'Developer Mode — Security Warning',
+              style: 'font-size:17px;font-weight:700;color:var(--text-danger,#f85149);letter-spacing:0.2px;'
+            });
+            header.appendChild(icon);
+            header.appendChild(title);
+            dialog.appendChild(header);
+
+            const body = createEl('div', {
+              style: 'font-size:14px;color:var(--text-secondary,#aaa);line-height:1.55;margin-bottom:18px;white-space:pre-line;max-height:340px;overflow-y:auto;padding-right:4px;'
+            });
+            body.textContent =
+              'WARNING: Developer Mode lowers the system\'s security posture and grants elevated access to internal components.\n\n' +
+              'When enabled, the following restrictions are relaxed:\n' +
+              '• Unrestricted access to the filesystem, networks, and system APIs\n' +
+              '• Elevated permissions to internal system modules and runtime internals\n' +
+              '• Visibility into running processes, memory, and module state\n' +
+              '• The ability to inspect, alter, or revoke app permissions\n' +
+              '• The ability to install, remove, or modify system packages\n\n' +
+              'The following internal apps and tools become accessible:\n' +
+              '• Console — runs arbitrary JavaScript in the full OS context with no sandboxing\n' +
+              '• Inspector — can force-close arbitrary windows and export app state\n' +
+              '• Packages — can install unsigned or unverified packages into the live registry, and can add a locally-generated signing key to this device\u2019s trust store for the current session (only affects installs on this machine; never affects other clones, forks, or devices)\n' +
+              '• Modules — can dynamically import arbitrary module paths for live code execution\n' +
+              '• Permissions — can bulk-grant or revoke permissions for any app without user consent\n' +
+              '• Perf — exposes detailed runtime performance data, memory usage, and per-window DOM breakdowns\n' +
+              '• SysAccess — can read the virtual filesystem and probe internal network/SSRF configuration\n' +
+               '• Events — full visibility into all system-wide activity, including console output, permission checks, package operations, and app event data payloads across every app and OS component\n' +
+              '• Debug Overlay — persistent always-on-top diagnostics overlay exposing GPU, memory, URLs, and OS internals (F3)\n\n' +
+              'Developer Mode is intended solely for development, debugging, and system maintenance. Enable it only when you understand the risks. Leave it disabled during normal use.';
+            dialog.appendChild(body);
+
+            const actions = createEl('div', {
+              style: 'display:flex;gap:10px;justify-content:flex-end;'
+            });
+            const cancelBtn = createEl('button', {
+              className: 'btn',
+              textContent: 'Cancel'
+            });
+            const confirmBtn = createEl('button', {
+              className: 'btn btn-danger',
+              textContent: 'Turn On Anyway'
+            });
+            actions.appendChild(cancelBtn);
+            actions.appendChild(confirmBtn);
+            dialog.appendChild(actions);
+            overlay.appendChild(dialog);
+            document.body.appendChild(overlay);
+
+            const done = (v) => { overlay.remove(); resolve(v); };
+            overlay.addEventListener('click', (e) => {
+              if (e.target === overlay) done(null);
+              const btn = e.target.closest('button');
+              if (btn && actions.contains(btn)) {
+                done(btn === confirmBtn ? 'confirm' : null);
+              }
+            });
+            confirmBtn.focus();
+          });
+          if (confirmed !== 'confirm') return;
+        }
+        OS.settings.set('devMode', next);
+        devToggle.classList.toggle('active', next);
+        if (window.DebugOverlay) {
+          next ? window.DebugOverlay.enable() : window.DebugOverlay.disable();
+        }
+        Notify.show({
+          title: next ? 'Developer Mode Enabled' : 'Developer Mode Disabled',
+          body: next ? 'Press F3 to toggle debug overlay' : undefined,
+          type: 'info',
+          appName: 'Settings'
+        });
+      });
+      devRow.appendChild(devToggle);
+      devGroup.appendChild(devRow);
+      mainContent.appendChild(devGroup);
+    }
+
+    // ── Date and Region ────────────────────────────────────────────────────
+    function renderDateAndRegion() {
+      mainContent.appendChild(createEl('h2', { textContent: 'Date and Region', style: { marginBottom: '20px' } }));
+
+      let i18n = null;
+      try { i18n = require('i18next'); } catch (e) { /* optional */ }
+
+      const REGIONS = [
+        { code: 'fa-AF', name: 'افغانستان' },
+        { code: 'sv-AX', name: 'Åland' },
+        { code: 'sq-AL', name: 'Albania' },
+        { code: 'fr-DZ', name: 'Algérie' },
+        { code: 'pt-AO', name: 'Angola' },
+        { code: 'en-AG', name: 'Antigua and Barbuda' },
+        { code: 'es-AR', name: 'Argentina' },
+        { code: 'hy-AM', name: 'Hayastán' },
+        { code: 'en-AU', name: 'Australia' },
+        { code: 'de-AT', name: 'Österreich' },
+        { code: 'az-AZ', name: 'Azərbaycan' },
+        { code: 'en-BS', name: 'Bahamas' },
+        { code: 'ar-BH', name: 'البحرين' },
+        { code: 'bn-BD', name: 'বাংলাদেশ' },
+        { code: 'en-BB', name: 'Barbados' },
+        { code: 'be-BY', name: 'Беларусь' },
+        { code: 'fr-BE', name: 'Belgique' },
+        { code: 'en-BZ', name: 'Belize' },
+        { code: 'en-BM', name: 'Bermuda' },
+        { code: 'dz-BT', name: 'འབྲུག་ཡུལ' },
+        { code: 'es-BO', name: 'Bolivia' },
+        { code: 'bs-BA', name: 'Bosna i Hercegovina' },
+        { code: 'tn-BW', name: 'Botswana' },
+        { code: 'pt-BR', name: 'Brasil' },
+        { code: 'ms-BN', name: 'Brunei' },
+        { code: 'bg-BG', name: 'България' },
+        { code: 'fr-BF', name: 'Burkina Faso' },
+        { code: 'fr-BI', name: 'Burundi' },
+        { code: 'pt-CV', name: 'Cabo Verde' },
+        { code: 'km-KH', name: 'កម្ពុជា' },
+        { code: 'fr-CM', name: 'Cameroun' },
+        { code: 'fr-CA', name: 'Canada' },
+        { code: 'en-KY', name: 'Cayman Islands' },
+        { code: 'fr-CF', name: 'RCA' },
+        { code: 'fr-TD', name: 'Tchad' },
+        { code: 'es-CL', name: 'Chile' },
+        { code: 'zh-CN', name: '中国' },
+        { code: 'es-CO', name: 'Colombia' },
+        { code: 'fr-CG', name: 'Congo' },
+        { code: 'es-CR', name: 'Costa Rica' },
+        { code: 'fr-CI', name: 'Côte d\'Ivoire' },
+        { code: 'hr-HR', name: 'Hrvatska' },
+        { code: 'es-CU', name: 'Cuba' },
+        { code: 'el-CY', name: 'Κύπρος' },
+        { code: 'cs-CZ', name: 'Česká republika' },
+        { code: 'da-DK', name: 'Danmark' },
+        { code: 'ar-DJ', name: 'جيبوتي' },
+        { code: 'en-DM', name: 'Dominica' },
+        { code: 'es-DO', name: 'República Dominicana' },
+        { code: 'fr-CD', name: 'RDC' },
+        { code: 'es-EC', name: 'Ecuador' },
+        { code: 'ar-EG', name: 'مصر' },
+        { code: 'es-SV', name: 'El Salvador' },
+        { code: 'ti-ER', name: 'Eritrea' },
+        { code: 'et-EE', name: 'Eesti' },
+        { code: 'am-ET', name: 'ኢትዮጵያ' },
+        { code: 'fo-FO', name: 'Føroyar' },
+        { code: 'fj-FJ', name: 'Fiji' },
+        { code: 'fi-FI', name: 'Suomi' },
+        { code: 'fr-FR', name: 'France' },
+        { code: 'ty-PF', name: 'Polynésie française' },
+        { code: 'fr-GA', name: 'Gabon' },
+        { code: 'en-GM', name: 'Gambia' },
+        { code: 'ka-GE', name: 'საქართველო' },
+        { code: 'de-DE', name: 'Deutschland' },
+        { code: 'en-GH', name: 'Ghana' },
+        { code: 'el-GR', name: 'Ελλάδα' },
+        { code: 'kl-GL', name: 'Kalaallit Nunaat' },
+        { code: 'en-GD', name: 'Grenada' },
+        { code: 'es-GT', name: 'Guatemala' },
+        { code: 'fr-GG', name: 'Guernesey' },
+        { code: 'pt-GW', name: 'Guiné-Bissau' },
+        { code: 'fr-GY', name: 'Guyane' },
+        { code: 'es-HN', name: 'Honduras' },
+        { code: 'zh-HK', name: '香港' },
+        { code: 'hu-HU', name: 'Magyarország' },
+        { code: 'is-IS', name: 'Ísland' },
+        { code: 'hi-IN', name: 'भारत' },
+        { code: 'id-ID', name: 'Indonesia' },
+        { code: 'fa-IR', name: 'ایران' },
+        { code: 'ar-IQ', name: 'العراق' },
+        { code: 'ga-IE', name: 'Éire' },
+        { code: 'gv-IM', name: 'Ellan Vannin' },
+        { code: 'he-IL', name: 'ישראל' },
+        { code: 'it-IT', name: 'Italia' },
+        { code: 'en-JM', name: 'Jamaica' },
+        { code: 'ja-JP', name: '日本' },
+        { code: 'fr-JE', name: 'Jersey' },
+        { code: 'ar-JO', name: 'الأردن' },
+        { code: 'kk-KZ', name: 'Қазақстан' },
+        { code: 'sw-KE', name: 'Kenya' },
+        { code: 'en-KI', name: 'Kiribati' },
+        { code: 'ar-KW', name: 'الكويت' },
+        { code: 'ky-KG', name: 'Кыргызстан' },
+        { code: 'lo-LA', name: 'ປະເທດລາວ' },
+        { code: 'lv-LV', name: 'Latvija' },
+        { code: 'ar-LB', name: 'لبنان' },
+        { code: 'en-LR', name: 'Liberia' },
+        { code: 'ar-LY', name: 'ليبيا' },
+        { code: 'lt-LT', name: 'Lietuva' },
+        { code: 'lb-LU', name: 'Lëtzebuerg' },
+        { code: 'zh-MO', name: '澳門' },
+        { code: 'mg-MG', name: 'Madagascar' },
+        { code: 'en-MW', name: 'Malawi' },
+        { code: 'ms-MY', name: 'Malaysia' },
+        { code: 'dv-MV', name: 'ދިވެހިރާއްޖެ' },
+        { code: 'fr-ML', name: 'Mali' },
+        { code: 'mt-MT', name: 'Malta' },
+        { code: 'en-MH', name: 'Marshall Islands' },
+        { code: 'ar-MR', name: 'موريتانيا' },
+        { code: 'fr-MU', name: 'Maurice' },
+        { code: 'es-MX', name: 'México' },
+        { code: 'en-FM', name: 'Micronesia' },
+        { code: 'ru-MD', name: 'Moldova' },
+        { code: 'mn-MN', name: 'Монгол' },
+        { code: 'ar-MA', name: 'المغرب' },
+        { code: 'pt-MZ', name: 'Moçambique' },
+        { code: 'my-MM', name: 'မြန်မာ' },
+        { code: 'af-NA', name: 'Afrika (Namibië)' },
+        { code: 'en-NR', name: 'Nauru' },
+        { code: 'ne-NP', name: 'नेपाल' },
+        { code: 'nl-NL', name: 'Nederland' },
+        { code: 'fr-NC', name: 'Nouvelle-Calédonie' },
+        { code: 'mi-NZ', name: 'Aotearoa' },
+        { code: 'es-NI', name: 'Nicaragua' },
+        { code: 'fr-NE', name: 'Niger' },
+        { code: 'en-NG', name: 'Nigeria' },
+        { code: 'ko-KP', name: '조선민주주의인민공화국' },
+        { code: 'mk-MK', name: 'Македонија' },
+        { code: 'nb-NO', name: 'Norge' },
+        { code: 'ar-OM', name: 'عُمان' },
+        { code: 'ur-PK', name: 'پاکستان' },
+        { code: 'en-PW', name: 'Palau' },
+        { code: 'ar-PS', name: 'فلسطين' },
+        { code: 'es-PA', name: 'Panamá' },
+        { code: 'en-PG', name: 'Papua New Guinea' },
+        { code: 'gn-PY', name: 'Paraguái' },
+        { code: 'es-PE', name: 'Perú' },
+        { code: 'fil-PH', name: 'Pilipinas' },
+        { code: 'pl-PL', name: 'Polska' },
+        { code: 'pt-PT', name: 'Portugal' },
+        { code: 'es-PR', name: 'Puerto Rico' },
+        { code: 'ar-QA', name: 'قطر' },
+        { code: 'fr-RE', name: 'Réunion' },
+        { code: 'ro-RO', name: 'România' },
+        { code: 'ru-RU', name: 'Россия' },
+        { code: 'fr-RW', name: 'Rwanda' },
+        { code: 'en-KN', name: 'Saint Kitts and Nevis' },
+        { code: 'en-LC', name: 'Saint Lucia' },
+        { code: 'en-VC', name: 'Saint Vincent' },
+        { code: 'sm-WS', name: 'Sāmoa' },
+        { code: 'pt-ST', name: 'São Tomé e Príncipe' },
+        { code: 'ar-SA', name: 'Arab Saudi' },
+        { code: 'fr-SN', name: 'Sénégal' },
+        { code: 'sr-RS', name: 'Србија' },
+        { code: 'fr-SC', name: 'Seychelles' },
+        { code: 'en-SL', name: 'Sierra Leone' },
+        { code: 'zh-SG', name: '新加坡' },
+        { code: 'sk-SK', name: 'Slovensko' },
+        { code: 'sl-SI', name: 'Slovenija' },
+        { code: 'en-SB', name: 'Solomon Islands' },
+        { code: 'so-SO', name: 'Soomaaliya' },
+        { code: 'zu-ZA', name: 'South Africa' },
+        { code: 'ko-KR', name: '대한민국' },
+        { code: 'ar-SS', name: 'South Sudan' },
+        { code: 'es-ES', name: 'España' },
+        { code: 'si-LK', name: 'ශ්‍රී ලංකා' },
+        { code: 'ar-SD', name: 'السودان' },
+        { code: 'nl-SR', name: 'Suriname' },
+        { code: 'sv-SE', name: 'Sverige' },
+        { code: 'de-CH', name: 'Schweiz' },
+        { code: 'ar-SY', name: 'سوريا' },
+        { code: 'zh-TW', name: '台灣' },
+        { code: 'tg-TJ', name: 'Тоҷикистон' },
+        { code: 'sw-TZ', name: 'Tanzania' },
+        { code: 'th-TH', name: 'ไทย' },
+        { code: 'pt-TL', name: 'Timor-Leste' },
+        { code: 'to-TO', name: 'Tonga' },
+        { code: 'en-TT', name: 'Trinidad and Tobago' },
+        { code: 'ar-TN', name: 'تونس' },
+        { code: 'tr-TR', name: 'Türkiye' },
+        { code: 'tk-TM', name: 'Türkmenistan' },
+        { code: 'en-TV', name: 'Tuvalu' },
+        { code: 'sw-UG', name: 'Uganda' },
+        { code: 'uk-UA', name: 'Україна' },
+        { code: 'ar-AE', name: 'الإمارات' },
+        { code: 'en-GB', name: 'United Kingdom' },
+        { code: 'en-US', name: 'United States' },
+        { code: 'es-UY', name: 'Uruguay' },
+        { code: 'uz-UZ', name: 'O\'zbekiston' },
+        { code: 'en-VU', name: 'Vanuatu' },
+        { code: 'es-VE', name: 'Venezuela' },
+        { code: 'vi-VN', name: 'Việt Nam' },
+        { code: 'fr-WF', name: 'Wallis et Futuna' },
+        { code: 'ar-YE', name: 'اليمن' },
+        { code: 'en-ZM', name: 'Zambia' },
+        { code: 'en-ZW', name: 'Zimbabwe' },
+      ];
+
+      // Maps a country code (the part after the hyphen in a region code,
+      // e.g. 'DE' in 'de-DE') to its ISO 4217 currency code, so the preview
+      // below reflects the selected region instead of always showing USD.
+      const REGION_CURRENCY = {
+        AE: 'AED',
+        AF: 'AFN',
+        AG: 'XCD',
+        AL: 'ALL',
+        AM: 'AMD',
+        AO: 'AOA',
+        AR: 'ARS',
+        AT: 'EUR',
+        AU: 'AUD',
+        AX: 'EUR',
+        AZ: 'AZN',
+        BA: 'BAM',
+        BB: 'BBD',
+        BD: 'BDT',
+        BE: 'EUR',
+        BF: 'XOF',
+        BG: 'BGN',
+        BH: 'BHD',
+        BI: 'BIF',
+        BM: 'BMD',
+        BN: 'BND',
+        BO: 'BOB',
+        BR: 'BRL',
+        BS: 'BSD',
+        BT: 'BTN',
+        BW: 'BWP',
+        BY: 'BYN',
+        BZ: 'BZD',
+        CA: 'CAD',
+        CD: 'CDF',
+        CF: 'XAF',
+        CG: 'XAF',
+        CH: 'CHF',
+        CI: 'XOF',
+        CL: 'CLP',
+        CM: 'XAF',
+        CN: 'CNY',
+        CO: 'COP',
+        CR: 'CRC',
+        CU: 'CUP',
+        CV: 'CVE',
+        CY: 'EUR',
+        CZ: 'CZK',
+        DE: 'EUR',
+        DJ: 'DJF',
+        DK: 'DKK',
+        DM: 'XCD',
+        DO: 'DOP',
+        DZ: 'DZD',
+        EC: 'USD',
+        EE: 'EUR',
+        EG: 'EGP',
+        ER: 'ERN',
+        ES: 'EUR',
+        ET: 'ETB',
+        FI: 'EUR',
+        FJ: 'FJD',
+        FM: 'USD',
+        FO: 'DKK',
+        FR: 'EUR',
+        GA: 'XAF',
+        GB: 'GBP',
+        GD: 'XCD',
+        GE: 'GEL',
+        GG: 'GBP',
+        GH: 'GHS',
+        GL: 'DKK',
+        GM: 'GMD',
+        GR: 'EUR',
+        GT: 'GTQ',
+        GW: 'XOF',
+        GY: 'GYD',
+        HK: 'HKD',
+        HN: 'HNL',
+        HR: 'EUR',
+        HU: 'HUF',
+        ID: 'IDR',
+        IE: 'EUR',
+        IL: 'ILS',
+        IM: 'GBP',
+        IN: 'INR',
+        IQ: 'IQD',
+        IR: 'IRR',
+        IS: 'ISK',
+        IT: 'EUR',
+        JE: 'GBP',
+        JM: 'JMD',
+        JO: 'JOD',
+        JP: 'JPY',
+        KE: 'KES',
+        KG: 'KGS',
+        KH: 'KHR',
+        KI: 'AUD',
+        KN: 'XCD',
+        KP: 'KPW',
+        KR: 'KRW',
+        KW: 'KWD',
+        KY: 'KYD',
+        KZ: 'KZT',
+        LA: 'LAK',
+        LB: 'LBP',
+        LC: 'XCD',
+        LK: 'LKR',
+        LR: 'LRD',
+        LT: 'EUR',
+        LU: 'EUR',
+        LV: 'EUR',
+        LY: 'LYD',
+        MA: 'MAD',
+        MD: 'MDL',
+        MG: 'MGA',
+        MH: 'USD',
+        MK: 'MKD',
+        ML: 'XOF',
+        MM: 'MMK',
+        MN: 'MNT',
+        MO: 'MOP',
+        MR: 'MRU',
+        MT: 'EUR',
+        MU: 'MUR',
+        MV: 'MVR',
+        MW: 'MWK',
+        MX: 'MXN',
+        MY: 'MYR',
+        MZ: 'MZN',
+        NA: 'NAD',
+        NC: 'XPF',
+        NE: 'XOF',
+        NG: 'NGN',
+        NI: 'NIO',
+        NL: 'EUR',
+        NO: 'NOK',
+        NP: 'NPR',
+        NR: 'AUD',
+        NZ: 'NZD',
+        OM: 'OMR',
+        PA: 'PAB',
+        PE: 'PEN',
+        PF: 'XPF',
+        PG: 'PGK',
+        PH: 'PHP',
+        PK: 'PKR',
+        PL: 'PLN',
+        PR: 'USD',
+        PS: 'ILS',
+        PT: 'EUR',
+        PW: 'USD',
+        PY: 'PYG',
+        QA: 'QAR',
+        RE: 'EUR',
+        RO: 'RON',
+        RS: 'RSD',
+        RU: 'RUB',
+        RW: 'RWF',
+        SA: 'SAR',
+        SB: 'SBD',
+        SC: 'SCR',
+        SD: 'SDG',
+        SE: 'SEK',
+        SG: 'SGD',
+        SI: 'EUR',
+        SK: 'EUR',
+        SL: 'SLE',
+        SN: 'XOF',
+        SO: 'SOS',
+        SR: 'SRD',
+        SS: 'SSP',
+        ST: 'STN',
+        SV: 'USD',
+        SY: 'SYP',
+        TD: 'XAF',
+        TH: 'THB',
+        TJ: 'TJS',
+        TL: 'USD',
+        TM: 'TMT',
+        TN: 'TND',
+        TO: 'TOP',
+        TR: 'TRY',
+        TT: 'TTD',
+        TV: 'AUD',
+        TW: 'TWD',
+        TZ: 'TZS',
+        UA: 'UAH',
+        UG: 'UGX',
+        US: 'USD',
+        UY: 'UYU',
+        UZ: 'UZS',
+        VC: 'XCD',
+        VE: 'VES',
+        VN: 'VND',
+        VU: 'VUV',
+        WF: 'XPF',
+        WS: 'WST',
+        YE: 'YER',
+        ZA: 'ZAR',
+        ZM: 'ZMW',
+        ZW: 'ZWL',
+      };
+      const savedRegion = OS.settings.get('region') || navigator.language || 'en-US';
+      const currentRegion = REGIONS.find(r => r.code === savedRegion) ? savedRegion : 'en-US';
+
+      const TIMEZONES = [
+        'Africa/Abidjan', 'Africa/Accra', 'Africa/Addis_Ababa', 'Africa/Algiers',
+        'Africa/Asmara', 'Africa/Bamako', 'Africa/Bangui', 'Africa/Banjul',
+        'Africa/Bissau', 'Africa/Blantyre', 'Africa/Brazzaville', 'Africa/Bujumbura',
+        'Africa/Cairo', 'Africa/Casablanca', 'Africa/Dakar', 'Africa/Dar_es_Salaam',
+        'Africa/Djibouti', 'Africa/Douala', 'Africa/Freetown', 'Africa/Gaborone',
+        'Africa/Harare', 'Africa/Johannesburg', 'Africa/Juba', 'Africa/Kampala',
+        'Africa/Khartoum', 'Africa/Kigali', 'Africa/Kinshasa', 'Africa/Lagos',
+        'Africa/Libreville', 'Africa/Luanda', 'Africa/Lusaka', 'Africa/Maputo',
+        'Africa/Mogadishu', 'Africa/Monrovia', 'Africa/Nairobi', 'Africa/Ndjamena',
+        'Africa/Niamey', 'Africa/Nouakchott', 'Africa/Ouagadougou', 'Africa/Sao_Tome',
+        'Africa/Tripoli', 'Africa/Tunis', 'Africa/Windhoek', 'America/Anchorage',
+        'America/Antigua', 'America/Argentina/Buenos_Aires', 'America/Asuncion', 'America/Barbados',
+        'America/Belize', 'America/Bogota', 'America/Caracas', 'America/Cayman',
+        'America/Chicago', 'America/Costa_Rica', 'America/Denver', 'America/Dominica',
+        'America/El_Salvador', 'America/Grenada', 'America/Guatemala', 'America/Guayaquil',
+        'America/Guyana', 'America/Havana', 'America/Jamaica', 'America/La_Paz',
+        'America/Lima', 'America/Los_Angeles', 'America/Managua', 'America/Mexico_City',
+        'America/Montevideo', 'America/Nassau', 'America/New_York', 'America/Noronha',
+        'America/Nuuk', 'America/Panama', 'America/Paramaribo', 'America/Phoenix',
+        'America/Port_of_Spain', 'America/Puerto_Rico', 'America/Regina', 'America/Santiago',
+        'America/Santo_Domingo', 'America/Sao_Paulo', 'America/St_Johns', 'America/St_Kitts',
+        'America/St_Lucia', 'America/St_Vincent', 'America/Tegucigalpa', 'America/Tijuana',
+        'America/Toronto', 'America/Vancouver', 'Antarctica/Casey', 'Antarctica/Davis',
+        'Antarctica/DumontDUrville', 'Antarctica/Macquarie', 'Antarctica/Mawson', 'Antarctica/McMurdo',
+        'Antarctica/Palmer', 'Antarctica/Rothera', 'Antarctica/South_Pole', 'Antarctica/Syowa',
+        'Antarctica/Troll', 'Antarctica/Vostok', 'Asia/Aden', 'Asia/Almaty',
+        'Asia/Amman', 'Asia/Anadyr', 'Asia/Ashgabat', 'Asia/Baghdad',
+        'Asia/Bahrain', 'Asia/Baku', 'Asia/Bangkok', 'Asia/Barnaul',
+        'Asia/Beirut', 'Asia/Bishkek', 'Asia/Brunei', 'Asia/Calcutta',
+        'Asia/Chongqing', 'Asia/Colombo', 'Asia/Dacca', 'Asia/Damascus',
+        'Asia/Dhaka', 'Asia/Dili', 'Asia/Dubai', 'Asia/Dushanbe',
+        'Asia/Gaza', 'Asia/Harbin', 'Asia/Ho_Chi_Minh', 'Asia/Hong_Kong',
+        'Asia/Irkutsk', 'Asia/Jakarta', 'Asia/Jayapura', 'Asia/Jerusalem',
+        'Asia/Kabul', 'Asia/Kamchatka', 'Asia/Karachi', 'Asia/Kashgar',
+        'Asia/Kathmandu', 'Asia/Katmandu', 'Asia/Kolkata', 'Asia/Krasnoyarsk',
+        'Asia/Kuala_Lumpur', 'Asia/Kuwait', 'Asia/Macao', 'Asia/Macau',
+        'Asia/Magadan', 'Asia/Makassar', 'Asia/Manila', 'Asia/Muscat',
+        'Asia/Nicosia', 'Asia/Novokuznetsk', 'Asia/Novosibirsk', 'Asia/Omsk',
+        'Asia/Phnom_Penh', 'Asia/Pyongyang', 'Asia/Qatar', 'Asia/Rangoon',
+        'Asia/Riyadh', 'Asia/Sakhalin', 'Asia/Seoul', 'Asia/Shanghai',
+        'Asia/Singapore', 'Asia/Taipei', 'Asia/Tashkent', 'Asia/Tbilisi',
+        'Asia/Tehran', 'Asia/Thimbu', 'Asia/Thimphu', 'Asia/Tokyo',
+        'Asia/Tomsk', 'Asia/Ulaanbaatar', 'Asia/Urumqi', 'Asia/Vientiane',
+        'Asia/Vladivostok', 'Asia/Yakutsk', 'Asia/Yangon', 'Asia/Yekaterinburg',
+        'Asia/Yerevan', 'Atlantic/Azores', 'Atlantic/Bermuda', 'Atlantic/Cape_Verde',
+        'Atlantic/Faroe', 'Atlantic/Reykjavik', 'Atlantic/South_Georgia', 'Australia/Adelaide',
+        'Australia/Brisbane', 'Australia/Currie', 'Australia/Darwin', 'Australia/Eucla',
+        'Australia/Hobart', 'Australia/Lindeman', 'Australia/Lord_Howe', 'Australia/Melbourne',
+        'Australia/Perth', 'Australia/Sydney', 'Europe/Amsterdam', 'Europe/Astrakhan',
+        'Europe/Athens', 'Europe/Belfast', 'Europe/Belgrade', 'Europe/Berlin',
+        'Europe/Bratislava', 'Europe/Brussels', 'Europe/Bucharest', 'Europe/Budapest',
+        'Europe/Chisinau', 'Europe/Copenhagen', 'Europe/Dublin', 'Europe/Guernsey',
+        'Europe/Helsinki', 'Europe/Isle_of_Man', 'Europe/Istanbul', 'Europe/Jersey',
+        'Europe/Kaliningrad', 'Europe/Kyiv', 'Europe/Lisbon', 'Europe/Ljubljana',
+        'Europe/London', 'Europe/Luxembourg', 'Europe/Madrid', 'Europe/Malta',
+        'Europe/Minsk', 'Europe/Moscow', 'Europe/Oslo', 'Europe/Paris',
+        'Europe/Prague', 'Europe/Riga', 'Europe/Rome', 'Europe/Sarajevo',
+        'Europe/Saratov', 'Europe/Skopje', 'Europe/Sofia', 'Europe/Stockholm',
+        'Europe/Tallinn', 'Europe/Tirane', 'Europe/Ulyanovsk', 'Europe/Vienna',
+        'Europe/Vilnius', 'Europe/Volgograd', 'Europe/Warsaw', 'Europe/Zagreb',
+        'Europe/Zurich', 'Indian/Antananarivo', 'Indian/Chagos', 'Indian/Christmas',
+        'Indian/Cocos', 'Indian/Kerguelen', 'Indian/Mahe', 'Indian/Maldives',
+        'Indian/Mauritius', 'Indian/Reunion', 'Pacific/Apia', 'Pacific/Auckland',
+        'Pacific/Chuuk', 'Pacific/Efate', 'Pacific/Fiji', 'Pacific/Funafuti',
+        'Pacific/Gambier', 'Pacific/Guadalcanal', 'Pacific/Guam', 'Pacific/Honolulu',
+        'Pacific/Johnston', 'Pacific/Kiritimati', 'Pacific/Kosrae', 'Pacific/Kwajalein',
+        'Pacific/Majuro', 'Pacific/Marquesas', 'Pacific/Midway', 'Pacific/Nauru',
+        'Pacific/Niue', 'Pacific/Norfolk', 'Pacific/Noumea', 'Pacific/Pago_Pago',
+        'Pacific/Palau', 'Pacific/Pohnpei', 'Pacific/Ponape', 'Pacific/Port_Moresby',
+        'Pacific/Rarotonga', 'Pacific/Saipan', 'Pacific/Tahiti', 'Pacific/Tarawa',
+        'Pacific/Tongatapu', 'Pacific/Truk', 'Pacific/Wallis', 'Pacific/Yap',
+      ];
+
+      const savedTimezone = OS.settings.get('timezone') || (typeof Intl !== 'undefined' && Intl.DateTimeFormat ? Intl.DateTimeFormat().resolvedOptions().timeZone : 'UTC');
+      const currentTimezone = TIMEZONES.includes(savedTimezone) ? savedTimezone : (typeof Intl !== 'undefined' && Intl.DateTimeFormat ? Intl.DateTimeFormat().resolvedOptions().timeZone : 'UTC');
+
+      const regionToTimezone = {
+        'fa-AF': 'Asia/Kabul',
+        'sv-AX': 'Europe/Helsinki',
+        'sq-AL': 'Europe/Tirane',
+        'fr-DZ': 'Africa/Algiers',
+        'pt-AO': 'Africa/Luanda',
+        'en-AG': 'America/Antigua',
+        'es-AR': 'America/Argentina/Buenos_Aires',
+        'hy-AM': 'Asia/Yerevan',
+        'en-AU': 'Australia/Sydney',
+        'de-AT': 'Europe/Vienna',
+        'az-AZ': 'Asia/Baku',
+        'en-BS': 'America/Nassau',
+        'ar-BH': 'Asia/Bahrain',
+        'bn-BD': 'Asia/Dhaka',
+        'en-BB': 'America/Barbados',
+        'be-BY': 'Europe/Minsk',
+        'fr-BE': 'Europe/Brussels',
+        'en-BZ': 'America/Belize',
+        'en-BM': 'Atlantic/Bermuda',
+        'dz-BT': 'Asia/Thimphu',
+        'es-BO': 'America/La_Paz',
+        'bs-BA': 'Europe/Sarajevo',
+        'tn-BW': 'Africa/Gaborone',
+        'pt-BR': 'America/Sao_Paulo',
+        'ms-BN': 'Asia/Brunei',
+        'bg-BG': 'Europe/Sofia',
+        'fr-BF': 'Africa/Ouagadougou',
+        'fr-BI': 'Africa/Bujumbura',
+        'pt-CV': 'Atlantic/Cape_Verde',
+        'km-KH': 'Asia/Phnom_Penh',
+        'fr-CM': 'Africa/Douala',
+        'fr-CA': 'America/Toronto',
+        'en-KY': 'America/Cayman',
+        'fr-CF': 'Africa/Bangui',
+        'fr-TD': 'Africa/Ndjamena',
+        'es-CL': 'America/Santiago',
+        'zh-CN': 'Asia/Shanghai',
+        'es-CO': 'America/Bogota',
+        'fr-CG': 'Africa/Brazzaville',
+        'es-CR': 'America/Costa_Rica',
+        'fr-CI': 'Africa/Abidjan',
+        'hr-HR': 'Europe/Zagreb',
+        'es-CU': 'America/Havana',
+        'el-CY': 'Asia/Nicosia',
+        'cs-CZ': 'Europe/Prague',
+        'da-DK': 'Europe/Copenhagen',
+        'ar-DJ': 'Africa/Djibouti',
+        'en-DM': 'America/Dominica',
+        'es-DO': 'America/Santo_Domingo',
+        'fr-CD': 'Africa/Kinshasa',
+        'es-EC': 'America/Guayaquil',
+        'ar-EG': 'Africa/Cairo',
+        'es-SV': 'America/El_Salvador',
+        'ti-ER': 'Africa/Asmara',
+        'et-EE': 'Europe/Tallinn',
+        'am-ET': 'Africa/Addis_Ababa',
+        'fo-FO': 'Atlantic/Faroe',
+        'fj-FJ': 'Pacific/Fiji',
+        'fi-FI': 'Europe/Helsinki',
+        'fr-FR': 'Europe/Paris',
+        'ty-PF': 'Pacific/Tahiti',
+        'fr-GA': 'Africa/Libreville',
+        'en-GM': 'Africa/Banjul',
+        'ka-GE': 'Asia/Tbilisi',
+        'de-DE': 'Europe/Berlin',
+        'en-GH': 'Africa/Accra',
+        'el-GR': 'Europe/Athens',
+        'kl-GL': 'America/Nuuk',
+        'en-GD': 'America/Grenada',
+        'es-GT': 'America/Guatemala',
+        'fr-GG': 'Europe/Guernsey',
+        'pt-GW': 'Africa/Bissau',
+        'fr-GY': 'America/Guyana',
+        'es-HN': 'America/Tegucigalpa',
+        'zh-HK': 'Asia/Hong_Kong',
+        'hu-HU': 'Europe/Budapest',
+        'is-IS': 'Atlantic/Reykjavik',
+        'hi-IN': 'Asia/Kolkata',
+        'id-ID': 'Asia/Jakarta',
+        'fa-IR': 'Asia/Tehran',
+        'ar-IQ': 'Asia/Baghdad',
+        'ga-IE': 'Europe/Dublin',
+        'gv-IM': 'Europe/Isle_of_Man',
+        'he-IL': 'Asia/Jerusalem',
+        'it-IT': 'Europe/Rome',
+        'en-JM': 'America/Jamaica',
+        'ja-JP': 'Asia/Tokyo',
+        'fr-JE': 'Europe/Jersey',
+        'ar-JO': 'Asia/Amman',
+        'kk-KZ': 'Asia/Almaty',
+        'sw-KE': 'Africa/Nairobi',
+        'en-KI': 'Pacific/Tarawa',
+        'ar-KW': 'Asia/Kuwait',
+        'ky-KG': 'Asia/Bishkek',
+        'lo-LA': 'Asia/Vientiane',
+        'lv-LV': 'Europe/Riga',
+        'ar-LB': 'Asia/Beirut',
+        'en-LR': 'Africa/Monrovia',
+        'ar-LY': 'Africa/Tripoli',
+        'lt-LT': 'Europe/Vilnius',
+        'lb-LU': 'Europe/Luxembourg',
+        'zh-MO': 'Asia/Macau',
+        'mg-MG': 'Indian/Antananarivo',
+        'en-MW': 'Africa/Blantyre',
+        'ms-MY': 'Asia/Kuala_Lumpur',
+        'dv-MV': 'Indian/Maldives',
+        'fr-ML': 'Africa/Bamako',
+        'mt-MT': 'Europe/Malta',
+        'en-MH': 'Pacific/Majuro',
+        'ar-MR': 'Africa/Nouakchott',
+        'fr-MU': 'Indian/Mauritius',
+        'es-MX': 'America/Mexico_City',
+        'en-FM': 'Pacific/Chuuk',
+        'ru-MD': 'Europe/Chisinau',
+        'mn-MN': 'Asia/Ulaanbaatar',
+        'ar-MA': 'Africa/Casablanca',
+        'pt-MZ': 'Africa/Maputo',
+        'my-MM': 'Asia/Yangon',
+        'af-NA': 'Africa/Windhoek',
+        'en-NR': 'Pacific/Nauru',
+        'ne-NP': 'Asia/Kathmandu',
+        'nl-NL': 'Europe/Amsterdam',
+        'fr-NC': 'Pacific/Noumea',
+        'mi-NZ': 'Pacific/Auckland',
+        'es-NI': 'America/Managua',
+        'fr-NE': 'Africa/Niamey',
+        'en-NG': 'Africa/Lagos',
+        'ko-KP': 'Asia/Pyongyang',
+        'mk-MK': 'Europe/Skopje',
+        'nb-NO': 'Europe/Oslo',
+        'ar-OM': 'Asia/Muscat',
+        'ur-PK': 'Asia/Karachi',
+        'en-PW': 'Pacific/Palau',
+        'ar-PS': 'Asia/Gaza',
+        'es-PA': 'America/Panama',
+        'en-PG': 'Pacific/Port_Moresby',
+        'gn-PY': 'America/Asuncion',
+        'es-PE': 'America/Lima',
+        'fil-PH': 'Asia/Manila',
+        'pl-PL': 'Europe/Warsaw',
+        'pt-PT': 'Europe/Lisbon',
+        'es-PR': 'America/Puerto_Rico',
+        'ar-QA': 'Asia/Qatar',
+        'fr-RE': 'Indian/Reunion',
+        'ro-RO': 'Europe/Bucharest',
+        'ru-RU': 'Europe/Moscow',
+        'fr-RW': 'Africa/Kigali',
+        'en-KN': 'America/St_Kitts',
+        'en-LC': 'America/St_Lucia',
+        'en-VC': 'America/St_Vincent',
+        'sm-WS': 'Pacific/Apia',
+        'pt-ST': 'Africa/Sao_Tome',
+        'ar-SA': 'Asia/Riyadh',
+        'fr-SN': 'Africa/Dakar',
+        'sr-RS': 'Europe/Belgrade',
+        'fr-SC': 'Indian/Mahe',
+        'en-SL': 'Africa/Freetown',
+        'zh-SG': 'Asia/Singapore',
+        'sk-SK': 'Europe/Bratislava',
+        'sl-SI': 'Europe/Ljubljana',
+        'en-SB': 'Pacific/Guadalcanal',
+        'so-SO': 'Africa/Mogadishu',
+        'zu-ZA': 'Africa/Johannesburg',
+        'ko-KR': 'Asia/Seoul',
+        'ar-SS': 'Africa/Juba',
+        'es-ES': 'Europe/Madrid',
+        'si-LK': 'Asia/Colombo',
+        'ar-SD': 'Africa/Khartoum',
+        'nl-SR': 'America/Paramaribo',
+        'sv-SE': 'Europe/Stockholm',
+        'de-CH': 'Europe/Zurich',
+        'ar-SY': 'Asia/Damascus',
+        'zh-TW': 'Asia/Taipei',
+        'tg-TJ': 'Asia/Dushanbe',
+        'sw-TZ': 'Africa/Dar_es_Salaam',
+        'th-TH': 'Asia/Bangkok',
+        'pt-TL': 'Asia/Dili',
+        'to-TO': 'Pacific/Tongatapu',
+        'en-TT': 'America/Port_of_Spain',
+        'ar-TN': 'Africa/Tunis',
+        'tr-TR': 'Europe/Istanbul',
+        'tk-TM': 'Asia/Ashgabat',
+        'en-TV': 'Pacific/Funafuti',
+        'sw-UG': 'Africa/Kampala',
+        'uk-UA': 'Europe/Kyiv',
+        'ar-AE': 'Asia/Dubai',
+        'en-GB': 'Europe/London',
+        'en-US': 'America/New_York',
+        'es-UY': 'America/Montevideo',
+        'uz-UZ': 'Asia/Tashkent',
+        'en-VU': 'Pacific/Efate',
+        'es-VE': 'America/Caracas',
+        'vi-VN': 'Asia/Ho_Chi_Minh',
+        'fr-WF': 'Pacific/Wallis',
+        'ar-YE': 'Asia/Aden',
+        'en-ZM': 'Africa/Lusaka',
+        'en-ZW': 'Africa/Harare',
+      };
+
+      const regionGroup = createEl('div', { className: 'nook-group' });
+      regionGroup.appendChild(createEl('div', { className: 'nook-group-title', textContent: 'Region' }));
+
+      const regionRow = createEl('div', { className: 'nook-row' });
+      regionRow.appendChild(createEl('span', { className: 'nook-row-label', textContent: 'Date & Currency Format' }));
+
+      const regionSelect = document.createElement('select');
+      regionSelect.className = 'input';
+      for (const r of REGIONS) {
+        const opt = document.createElement('option');
+        opt.value = r.code;
+        opt.textContent = r.name;
+        if (r.code === currentRegion) opt.selected = true;
+        regionSelect.appendChild(opt);
+      }
+      regionRow.appendChild(regionSelect);
+      regionGroup.appendChild(regionRow);
+      mainContent.appendChild(regionGroup);
+
+      const timezoneSelect = document.createElement('select');
+      timezoneSelect.className = 'input';
+      for (const tz of TIMEZONES) {
+        const opt = document.createElement('option');
+        opt.value = tz;
+        opt.textContent = tz;
+        if (tz === currentTimezone) opt.selected = true;
+        timezoneSelect.appendChild(opt);
+      }
+      timezoneSelect.addEventListener('change', () => {
+        OS.settings.set('timezone', timezoneSelect.value);
+        renderContent();
+      });
+
+      const timezoneGroup = createEl('div', { className: 'nook-group' });
+      timezoneGroup.appendChild(createEl('div', { className: 'nook-group-title', textContent: 'Timezone' }));
+      const timezoneRow = createEl('div', { className: 'nook-row' });
+      timezoneRow.appendChild(createEl('span', { className: 'nook-row-label', textContent: 'Current Timezone' }));
+      timezoneRow.appendChild(timezoneSelect);
+      timezoneGroup.appendChild(timezoneRow);
+      mainContent.appendChild(timezoneGroup);
+
+      regionSelect.addEventListener('change', async () => {
+        const selected = regionSelect.value;
+        OS.settings.set('region', selected);
+        const mappedTz = regionToTimezone[selected];
+        if (mappedTz && TIMEZONES.includes(mappedTz)) {
+          OS.settings.set('timezone', mappedTz);
+          timezoneSelect.value = mappedTz;
+        }
+        if (i18n) {
+          try { await i18n.changeLanguage(selected); } catch (err) { console.warn('[Settings] i18next changeLanguage failed:', err); }
+        }
+        try { document.documentElement.lang = selected; } catch {}
+        renderContent();
+      });
+
+      const kbGroup = createEl('div', { className: 'nook-group' });
+      kbGroup.appendChild(createEl('div', { className: 'nook-group-title', textContent: 'Keyboard Layout' }));
+
+      const kbRow = createEl('div', { className: 'nook-row' });
+      kbRow.appendChild(createEl('span', { className: 'nook-row-label', textContent: 'Detected Layout' }));
+      const kbValue = createEl('span', { style: 'color:var(--text-primary);font-weight:500;', textContent: 'Detecting...' });
+      kbRow.appendChild(kbValue);
+      kbGroup.appendChild(kbRow);
+      mainContent.appendChild(kbGroup);
+
+      const previewGroup = createEl('div', { className: 'nook-group' });
+      previewGroup.appendChild(createEl('div', { className: 'nook-group-title', textContent: 'Live Preview' }));
+      const previewRow = createEl('div', { style: 'padding:12px 0;font-size:12.5px;color:var(--text-secondary);', id: 'region-preview' });
+      previewGroup.appendChild(previewRow);
+      mainContent.appendChild(previewGroup);
+
+      function getEffectiveLocale() {
+        if (i18n && typeof i18n.language === 'string' && i18n.language) return i18n.language;
+        return OS.settings.get('region') || navigator.language || 'en-US';
+      }
+
+      function updatePreview(region, timezone) {
+        const previewEl = document.getElementById('region-preview');
+        if (!previewEl) return;
+        const now = new Date();
+        const locale = getEffectiveLocale();
+        const tz = timezone || OS.settings.get('timezone');
+        const opts = { dateStyle: 'full', timeStyle: 'long' };
+        if (tz) opts.timeZone = tz;
+        const dateStr = new Intl.DateTimeFormat(locale, opts).format(now);
+        // Currency was hardcoded to USD here regardless of region. Derive
+        // it from the selected region's country code instead, falling back
+        // to the locale (and then USD) if we don't have a mapping for it.
+        const effectiveRegion = region || locale;
+        const countryCode = String(effectiveRegion).split('-')[1]?.toUpperCase();
+        const currencyCode = (countryCode && REGION_CURRENCY[countryCode]) || 'USD';
+        let currencyStr;
+        try {
+          currencyStr = new Intl.NumberFormat(locale, { style: 'currency', currency: currencyCode }).format(1234.56);
+        } catch (e) {
+          // Intl throws on an unrecognized currency code -- fall back to USD
+          // rather than breaking the whole preview over a bad/missing mapping.
+          currencyStr = new Intl.NumberFormat(locale, { style: 'currency', currency: 'USD' }).format(1234.56);
+        }
+        previewEl.innerHTML = '<div style="margin-bottom:8px;"><strong>Date & Time:</strong> ' + dateStr + '</div>' +
+                              '<div><strong>Currency:</strong> ' + currencyStr + '</div>';
+      }
+
+
+      if (navigator.keyboard && typeof navigator.keyboard.getLayoutMap === 'function') {
+        navigator.keyboard.getLayoutMap().then(map => {
+          const a = map.get('KeyA');
+          const q = map.get('KeyQ');
+          let layout = 'Unknown';
+          if (a === 'a' && q === 'q') layout = 'QWERTY';
+          else if (a === 'q' && q === 'a') layout = 'AZERTY';
+          else if (a === 'a' && q === 'w') layout = 'QWERTZ';
+          else if (a) layout = 'Custom (' + a + ')';
+          kbValue.textContent = layout;
+        }).catch(() => { kbValue.textContent = 'Not available'; });
+      } else {
+        kbValue.textContent = 'Not supported';
+      }
+
+      updatePreview(currentRegion);
     }
 
     // ── Storage ─────────────────────────────────────────────────────────────
@@ -435,6 +1355,16 @@ registerApp({
           try {
             if (typeof OPFS !== 'undefined' && OPFS.clear) await OPFS.clear();
           } catch { /* OPFS unavailable */ }
+          // Each installed .novaapp runs in its own isolated webview storage
+          // partition (persist:app_<id> — see app-sandbox.js createSandbox()).
+          // That's separate from localStorage/IndexedDB/OPFS above, so it
+          // survives unless cleared per app, per partition.
+          try {
+            const appIds = (typeof OS !== 'undefined' && OS.apps) ? Object.keys(OS.apps) : [];
+            if (typeof AppSandbox !== 'undefined' && AppSandbox.clearAppPartitions) {
+              await AppSandbox.clearAppPartitions(appIds);
+            }
+          } catch { /* app partition wipe best-effort */ }
           location.reload();
         }
       });
@@ -635,6 +1565,29 @@ registerApp({
       motionGroup.appendChild(motionRow);
       mainContent.appendChild(motionGroup);
 
+      // Transparency
+      const transparencyGroup = createEl('div', { className: 'nook-group' });
+      transparencyGroup.appendChild(createEl('div', { className: 'nook-group-title', textContent: 'Transparency' }));
+      const transparencyRow = createEl('div', { className: 'nook-toggle-row' });
+      transparencyRow.appendChild(createEl('span', { textContent: 'Remove Transparency' }));
+      const transparencyToggle = createEl('button', {
+        className: 'toggle' + (OS.settings.get('removeTransparency') ? ' active' : '')
+      });
+      transparencyToggle.addEventListener('click', () => {
+        const next = !OS.settings.get('removeTransparency');
+        OS.settings.set('removeTransparency', next);
+        document.documentElement.classList.toggle('no-transparency', next);
+        transparencyToggle.classList.toggle('active', next);
+      });
+      transparencyRow.appendChild(transparencyToggle);
+      transparencyGroup.appendChild(transparencyRow);
+      mainContent.appendChild(transparencyGroup);
+      const transparencyHint = createEl('p', {
+        textContent: 'Makes windows, menus, and panels fully solid — removes blur and see-through backgrounds everywhere.',
+        style: { color: 'var(--text-secondary)', fontSize: '12px', marginTop: '-8px', marginBottom: '20px' }
+      });
+      mainContent.appendChild(transparencyHint);
+
       // Icon Size
       const iconSizeGroup = createEl('div', { className: 'nook-group' });
       iconSizeGroup.appendChild(createEl('div', { className: 'nook-group-title', textContent: 'Icon Size' }));
@@ -695,6 +1648,13 @@ registerApp({
       const builtIns = [...appIds].filter(id => !id.startsWith('wa_') && !novaAppIds.has(id)).sort();
       const webApps  = [...appIds].filter(id =>  id.startsWith('wa_')).sort();
 
+      const devMode = OS.settings.get('devMode');
+      const visibleBuiltIns = builtIns.filter(id => {
+        if (devMode) return true;
+        const entry = OS.apps[id];
+        return !entry?.devOnly;
+      });
+
       function buildAppCard(appId, novaData) {
         const entry   = (typeof OS !== 'undefined' && OS.apps) ? OS.apps[appId] : null;
         const appName = novaData?.name ?? entry?.name ?? appId;
@@ -731,12 +1691,16 @@ registerApp({
         const iconVal  = novaData?.icon ?? entry?.icon ?? null;
         const isEmoji  = iconVal && /\p{Emoji}/u.test(iconVal) && iconVal.length <= 4;
         const isSvgKey = iconVal && !isEmoji && /^[a-z][a-z0-9-]*$/.test(iconVal);
+        const isDataUri = iconVal && typeof iconVal === 'string' && iconVal.startsWith('data:image/svg+xml;base64,');
         if (isSvgKey && typeof svgIcon === 'function') {
           iconEl.innerHTML = svgIcon(iconVal, 18);
           iconEl.style.color = 'var(--accent)';
         } else if (isEmoji) {
           iconEl.style.fontSize = '20px';
           iconEl.textContent = iconVal;
+        } else if (isDataUri) {
+          iconEl.style.background = 'transparent';
+          iconEl.innerHTML = '<img src="' + iconVal + '" width="18" height="18" style="display:block;" draggable="false" alt="">';
         } else {
           iconEl.textContent = appName.charAt(0).toUpperCase();
         }
@@ -783,6 +1747,10 @@ registerApp({
         // Expandable body
         const body = createEl('div', { style: 'display:none;border-top:1px solid var(--border-subtle);' });
 
+        // Keep references to each permission's toggle so we can sync them
+        // in-place (e.g. after "Reset All Permissions") without a full re-render.
+        const toggleEls = {};
+
         if (dangerous.length > 0) {
           const section = createEl('div', { style: 'padding:10px 14px 6px;' });
           section.appendChild(createEl('div', {
@@ -822,6 +1790,9 @@ registerApp({
             });
             slider.appendChild(knob);
             toggleWrap.append(toggleInput, slider);
+
+            // Register so "Reset All Permissions" can sync this toggle's visuals too
+            toggleEls[perm] = { toggleInput, slider, knob };
 
             toggleInput.addEventListener('change', async () => {
               if (toggleInput.checked) {
@@ -872,6 +1843,17 @@ registerApp({
             } else {
               await mgr.revokeAllPermissions(appId);
             }
+            // Sync every toggle's checked state + slider/knob visuals now that
+            // the underlying grants have been cleared — previously only the
+            // header badges were refreshed, leaving switches stuck "on" until
+            // the card was collapsed/reopened.
+            for (const p of dangerous) {
+              const t = toggleEls[p];
+              if (!t) continue;
+              t.toggleInput.checked = false;
+              t.slider.style.background = 'var(--bg-elevated)';
+              t.knob.style.left = '2px';
+            }
             Notify.show({ title: 'Permissions Reset', body: appName + ' will be asked again next launch.', type: 'info', appName: 'Settings' });
             refreshBadges();
           });
@@ -891,9 +1873,9 @@ registerApp({
         return card;
       }
 
-      if (builtIns.length > 0) {
+      if (visibleBuiltIns.length > 0) {
         mainContent.appendChild(createEl('div', { textContent: 'BUILT-IN APPS', style: 'font-size:10px;font-weight:700;letter-spacing:0.07em;color:var(--text-muted);margin-bottom:10px;' }));
-        for (const id of builtIns) {
+        for (const id of visibleBuiltIns) {
           const card = buildAppCard(id);
           if (card) mainContent.appendChild(card);
         }
@@ -915,7 +1897,7 @@ registerApp({
         }
       }
 
-      if (builtIns.length === 0 && webApps.length === 0 && novaApps.length === 0) {
+      if (visibleBuiltIns.length === 0 && webApps.length === 0 && novaApps.length === 0) {
         const empty = createEl('div', { style: 'text-align:center;color:var(--text-muted);padding:40px 0;font-size:13px;' });
         empty.textContent = 'No apps found.';
         mainContent.appendChild(empty);
@@ -933,33 +1915,95 @@ registerApp({
       const exportActions = createEl('div', { className: 'nook-data-actions' });
 
       const exportBtn = createEl('button', { className: 'btn btn-sm', textContent: 'Export All Data (JSON)' });
-      exportBtn.addEventListener('click', () => {
-        const data = {
-          settings:   { ...(OS.settings._cache || {}) },
-          version:    OS.version,
-          exportDate: new Date().toISOString()
-        };
-        const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
-        const url  = URL.createObjectURL(blob);
-        const a    = createEl('a', { href: url, download: 'novabyte-export.json' });
-        a.click();
-        URL.revokeObjectURL(url);
-        Notify.show({ title: 'Data Exported', body: 'All data has been exported', type: 'success', appName: 'Nook' });
+      exportBtn.addEventListener('click', async () => {
+        exportBtn.disabled = true;
+        const prevLabel = exportBtn.textContent;
+        exportBtn.textContent = 'Exporting…';
+        try {
+          // Pull every real data domain, not just the in-memory settings cache.
+          // Note: calendar events live in localStorage (calendar.js writes them
+          // directly, bypassing the fs worker), so they're picked up below.
+          const [settings, files] = await Promise.all([
+            OS.workers.fs.call('getAllSettings').catch(() => ({ ...(OS.settings._cache || {}) })),
+            OS.workers.fs.call('getAllFiles').catch(() => [])
+          ]);
+
+          // localStorage holds per-app data (installed apps, contacts, bookmarks,
+          // downloads, permissions, etc.) with no shared key prefix, so we sweep
+          // it wholesale — this is a dedicated app window, not a shared browser origin.
+          const localStorageData = {};
+          for (let i = 0; i < localStorage.length; i++) {
+            const key = localStorage.key(i);
+            localStorageData[key] = localStorage.getItem(key);
+          }
+
+          const data = {
+            settings,
+            files,
+            localStorage: localStorageData,
+            version:    OS.version,
+            exportDate: new Date().toISOString()
+          };
+          const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+          const url  = URL.createObjectURL(blob);
+          const a    = createEl('a', { href: url, download: 'novabyte-export.json' });
+          document.body.appendChild(a);
+          a.click();
+          a.remove();
+          URL.revokeObjectURL(url);
+          Notify.show({ title: 'Data Exported', body: 'All data has been exported', type: 'success', appName: 'Nook' });
+        } catch (e) {
+          Notify.show({ title: 'Export Failed', body: e && e.message ? e.message : 'Could not export data', type: 'error', appName: 'Nook' });
+        } finally {
+          exportBtn.disabled = false;
+          exportBtn.textContent = prevLabel;
+        }
       });
       exportActions.appendChild(exportBtn);
 
       const importBtn = createEl('button', { className: 'btn btn-sm', textContent: 'Import Data' });
       importBtn.addEventListener('click', () => {
-        const input = createEl('input', { type: 'file', accept: '.json', id: 'settings-import-input', name: 'settings-import' });
+        const input = createEl('input', { type: 'file', accept: '.json', id: 'settings-import-input', name: 'settings-import', style: 'display:none' });
+        document.body.appendChild(input);
         input.addEventListener('change', async () => {
           const file = input.files[0];
+          input.remove();
           if (!file) return;
           try {
             const text = await file.text();
             const data = JSON.parse(text);
+
+            const writes = [];
             if (data.settings && typeof data.settings === 'object') {
-              for (const [k, v] of Object.entries(data.settings)) OS.settings.set(k, v);
-              Notify.show({ title: 'Data Imported', body: 'Settings have been imported', type: 'success', appName: 'Nook' });
+              for (const [k, v] of Object.entries(data.settings)) {
+                OS.settings._cache[k] = v; // keep in-memory cache in sync immediately
+                writes.push(OS.workers.fs.call('putSetting', k, v));
+              }
+            }
+            if (Array.isArray(data.files) && data.files.length) {
+              writes.push(OS.workers.fs.call('putFiles', data.files));
+            }
+
+            // Wait for every fs-backed write to actually land before reporting
+            // success — this is the part that was previously fire-and-forget
+            // and silently failed with no error surfaced to the user.
+            const results = await Promise.allSettled(writes);
+            const failed = results.some(r => r.status === 'rejected');
+
+            if (data.localStorage && typeof data.localStorage === 'object') {
+              for (const [k, v] of Object.entries(data.localStorage)) {
+                try { localStorage.setItem(k, v); } catch { /* quota or blocked key, skip */ }
+              }
+            }
+
+            if (data.settings && typeof data.settings === 'object') {
+              OS.events.emit('settings:changed', { key: null, value: null, bulk: true });
+            }
+
+            if (failed) {
+              Notify.show({ title: 'Import Incomplete', body: 'Some data could not be saved. Try again.', type: 'error', appName: 'Nook' });
+            } else {
+              Notify.show({ title: 'Data Imported', body: 'All data has been imported. Restart to apply fully.', type: 'success', appName: 'Nook' });
             }
           } catch {
             Notify.show({ title: 'Import Failed', body: 'Invalid JSON file', type: 'error', appName: 'Nook' });
@@ -970,6 +2014,79 @@ registerApp({
       exportActions.appendChild(importBtn);
       exportSection.appendChild(exportActions);
       mainContent.appendChild(exportSection);
+
+      // Admin access — controls the server-side admin-state flag that
+      // req.user.role derives from. Off by default (see
+      // server/security/admin-state.js). This is what admin:* permission
+      // grants to sandboxed apps actually check against on top of the
+      // app-level grant — turning this on doesn't itself give any app
+      // access, it just makes the machine capable of honoring an
+      // admin:*-granted app's requests.
+      const adminSection = createEl('div', { className: 'nook-privacy-section' });
+      adminSection.appendChild(createEl('h3', { textContent: 'Admin Access' }));
+      adminSection.appendChild(createEl('p', {
+        textContent: 'Lets apps you\u2019ve granted admin permissions to (audit logs, system settings, sessions) actually use them. Off by default — most people never need this.',
+        style: { color: 'var(--text-secondary, #8b949e)', fontSize: '13px', marginBottom: '12px' }
+      }));
+      const adminRow = createEl('div', { className: 'nook-toggle-row' });
+      adminRow.appendChild(createEl('span', { textContent: 'Enable admin mode on this device' }));
+      const adminToggle = createEl('button', { className: 'toggle', disabled: true });
+      adminRow.appendChild(adminToggle);
+      adminSection.appendChild(adminRow);
+      mainContent.appendChild(adminSection);
+
+      // State lives server-side (not OS.settings/localStorage), since
+      // req.user.role is derived from it on every server request — fetch
+      // current value and enable the control once known, rather than
+      // guess/flash an incorrect initial state.
+      (async () => {
+        try {
+          const res = await fetch('/api/security/admin-mode');
+          const json = await res.json();
+          if (json && json.success) {
+            adminToggle.classList.toggle('active', !!json.adminEnabled);
+          }
+        } catch (e) {
+          // Leave disabled — can't safely toggle a value we couldn't confirm.
+          adminSection.appendChild(createEl('p', {
+            textContent: 'Could not reach the server to check admin status.',
+            style: { color: 'var(--danger, #f85149)', fontSize: '12px', marginTop: '8px' }
+          }));
+          return;
+        }
+        adminToggle.disabled = false;
+      })();
+
+      adminToggle.addEventListener('click', async () => {
+        if (adminToggle.disabled) return;
+        const next = !adminToggle.classList.contains('active');
+        adminToggle.disabled = true;
+        try {
+          const csrfToken = document.querySelector('meta[name="csrf-token"]')?.content || '';
+          const res = await fetch('/api/security/admin-mode', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrfToken },
+            body: JSON.stringify({ enabled: next })
+          });
+          const json = await res.json();
+          if (json && json.success) {
+            adminToggle.classList.toggle('active', !!json.adminEnabled);
+            Notify.show({
+              title: json.adminEnabled ? 'Admin Mode Enabled' : 'Admin Mode Disabled',
+              body: json.adminEnabled
+                ? 'Apps granted admin permissions can now use them.'
+                : 'Admin permission grants are now inert again.',
+              type: 'success', appName: 'Nook'
+            });
+          } else {
+            throw new Error(json?.message || 'Request failed');
+          }
+        } catch (e) {
+          Notify.show({ title: 'Could Not Update Admin Mode', body: e.message || 'Try again', type: 'error', appName: 'Nook' });
+        } finally {
+          adminToggle.disabled = false;
+        }
+      });
     }
 
     // ── Shortcuts ───────────────────────────────────────────────────────────
@@ -1117,7 +2234,7 @@ registerApp({
       const verBadge = createEl('div', { style: 'display:inline-flex;align-items:center;gap:5px;background:rgba(88,166,255,0.12);border:1px solid rgba(88,166,255,0.3);border-radius:20px;padding:2px 11px;font-size:11px;font-weight:700;color:var(--accent);margin-bottom:3px;' });
       verBadge.textContent = 'v' + OS.version;
       const tagline = createEl('div', { style: 'font-size:10.5px;color:var(--text-muted);font-style:italic;' });
-      tagline.textContent = '\u201cYour world. Your browser.\u201d';
+      tagline.textContent = '';
       logoMeta.append(lgTitle, verBadge, tagline);
       logoRow.append(logoBox, logoMeta);
       swRows.appendChild(logoRow);
@@ -1149,9 +2266,7 @@ registerApp({
         clickTimeout = setTimeout(() => { clickCount = 0; clickTimeout = null; }, 1500);
       });
       swRows.appendChild(novaVersionRow);
-
-      swRows.appendChild(mkRow('Build Channel', 'Stable'));
-      swRows.appendChild(mkRow('Release Date',  '2026-06-03'));
+      swRows.appendChild(mkRow('Source Date',  '2026-07-18'));
 
       const secRow      = createEl('div', { style: 'display:flex;justify-content:space-between;align-items:center;padding:9px 0;font-size:12.5px;border-top:1px solid var(--border-subtle);border-radius:6px;' });
       const secRowLeft  = createEl('div', { style: 'display:flex;align-items:center;gap:6px;' });
@@ -1159,7 +2274,7 @@ registerApp({
       secRow.appendChild(secRowLeft);
       const secRowRight = createEl('div', { style: 'display:flex;align-items:center;gap:6px;' });
       const secBadge    = createEl('span', { style: 'display:inline-flex;align-items:center;gap:5px;background:rgba(63,185,80,0.1);border:1px solid rgba(63,185,80,0.3);border-radius:20px;padding:2px 10px;font-size:10.5px;font-weight:700;color:#3fb950;' });
-      secBadge.textContent = '\uD83D\uDD12 2026-06-03';
+      secBadge.textContent = '\uD83D\uDD12 2026-07-04';
       secRowRight.appendChild(secBadge);
       secRow.appendChild(secRowRight);
       swRows.appendChild(secRow);
@@ -1180,11 +2295,11 @@ registerApp({
       // ── Environment ─────────────────────────────────────────────────────────
       const { wrap: envWrap, rows: envRows } = mkSection('Environment', '\uD83C\uDF10');
       let tz = 'Unknown';
-      try { tz = Intl.DateTimeFormat().resolvedOptions().timeZone || 'Unknown'; } catch { /* sandboxed */ }
+      try { tz = OS.settings.get('timezone') || Intl.DateTimeFormat().resolvedOptions().timeZone || 'Unknown'; } catch { /* sandboxed */ }
       [
         ['Browser',         detectBrowser(),                                                                          false],
         ['Platform',        navigator.platform,                                                                        false],
-        ['Language',        navigator.language,                                                                        false],
+        ['Region',          OS.settings.get('region') || navigator.language,                                          false],
         ['Timezone',        tz,                                                                                        false],
         ['Do Not Track',    navigator.doNotTrack === '1' ? 'Enabled \u2713' : 'Not set',                             false],
         ['Cookies',         navigator.cookieEnabled ? 'Enabled \u2713' : 'Disabled',                                 false],
@@ -1195,23 +2310,22 @@ registerApp({
       // ── Legal ───────────────────────────────────────────────────────────────
       const { wrap: lgWrap, rows: lgRows } = mkSection('Legal \u0026 Licences', '\u2696\uFE0F');
       lgRows.appendChild(mkRow('Licence',        'Apache 2.0'));
-      lgRows.appendChild(mkRow('Copyright',      '\u00A9 2024\u20132026 NovaByte'));
-      lgRows.appendChild(mkRow('Privacy Policy', 'Privacy-first. Zero telemetry.', true));
+      lgRows.appendChild(mkRow('Copyright',      '\u00A9 2026 NovaByteOfficial'));
       body.appendChild(lgWrap);
 
       // Copy system info
       const copyBtn = createEl('button', { className: 'btn btn-sm', textContent: '\uD83D\uDCCB Copy System Info' });
       copyBtn.addEventListener('click', () => {
         let tzCopy = 'Unknown';
-        try { tzCopy = Intl.DateTimeFormat().resolvedOptions().timeZone || 'Unknown'; } catch { /* sandboxed */ }
+        try { tzCopy = OS.settings.get('timezone') || Intl.DateTimeFormat().resolvedOptions().timeZone || 'Unknown'; } catch { /* sandboxed */ }
         const lines = [
           'NovaByte v' + OS.version,
-          'Security Update: 2026-06-03',
+          'Security Update: 2026-07-04',
           'Browser: '   + detectBrowser(),
           'Platform: '  + navigator.platform,
           'Screen: '    + screen.width + '\u00D7' + screen.height,
           'CPU Cores: ' + (navigator.hardwareConcurrency || 'Unknown'),
-          'Language: '  + navigator.language,
+          'Region: '    + (OS.settings.get('region') || navigator.language),
           'Timezone: '  + tzCopy,
         ];
         navigator.clipboard.writeText(lines.join('\n'));
@@ -1228,5 +2342,12 @@ registerApp({
 
     buildSidebar();
     renderContent();
+
+    if (typeof OS !== 'undefined' && OS.events && typeof OS.events.on === 'function') {
+      OS.events.on('settings:changed', ({ key }) => {
+        if (key === 'devMode' && currentSection === 'apps') renderContent();
+        if (key === 'region' && currentSection === 'about') renderContent();
+      });
+    }
   }
 });

@@ -5,10 +5,22 @@
  */
 
 const crypto = require('crypto');
+const ServerEventLog = require('../server/core/server-event-log');
 
-// auditService stub — logs security events to console.
-// Replace with a real audit logger if needed.
-const auditService = { log: (e) => console.log('[Audit]', JSON.stringify(e)) };
+// auditService — every call site here passes a consistent
+// { action, resource, success, ipAddress?, userId?, metadata? } shape.
+// Forward it into ServerEventLog (which the Events app timeline reads via
+// SSE) rather than just console.log-ing it into the void.
+const auditService = {
+    log: (e) => {
+        ServerEventLog.log({
+            app: 'SecurityMiddleware',
+            severity: e.success === false ? 'warn' : 'info',
+            message: `${e.resource || e.action || 'security_event'}${e.success === false ? ' — denied' : ''}`,
+            data: e,
+        });
+    }
+};
 
 // Configuration
 let config = {
@@ -122,16 +134,6 @@ function ipThrottleMiddleware(req, res, next) {
     }
     // Email API is already session-protected; don't throttle folder switching
     if (req.path.startsWith('/api/email/')) {
-        return next();
-    }
-    // Email image proxy — localhost-only, fires once per inline image per email;
-    // a single HTML email can have 20+ images, easily blowing past 30/min
-    if (req.path.startsWith('/api/email-image')) {
-        return next();
-    }
-    // Search suggest proxy — fires on every keystroke (debounced to ~120ms);
-    // has its own dedicated suggestLimiter (120/min) in server.js
-    if (req.path.startsWith('/api/suggest')) {
         return next();
     }
     // Favicon proxy — has its own dedicated faviconLimiter in server.js
@@ -327,6 +329,14 @@ function inputSanitization(req, res, next) {
     // Optional: skip backups too (they can contain raw file data)
     if (req.path.startsWith('/api/backups/')) return next();
 
+    // App network proxy — forwards req.body.body verbatim to a caller-specified
+    // external URL. This isn't HTML novabyte-os ever renders, so HTML-escaping
+    // it here doesn't prevent anything; it corrupts JSON bodies in transit
+    // (quotes -> &quot;, ampersands -> &amp;), which breaks the target API's
+    // own JSON parsing (e.g. "invalid character '&' looking for beginning of
+    // value"). The proxy route itself still validates URL/method/host.
+    if (req.path === '/api/proxy') return next();
+
     if (req.body && typeof req.body === 'object') {
         req.body = sanitizeObject(req.body);
     }
@@ -512,7 +522,18 @@ function securityHeaders(req, res, next) {
     res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
 
     // Permissions Policy
-    res.setHeader('Permissions-Policy', 'geolocation=(), microphone=(), camera=()');
+    //
+    // This HTTP header is the one that actually wins: per spec, an HTTP
+    // Permissions-Policy header always overrides a <meta http-equiv> version
+    // of the same policy, so fixing index.html's meta tag alone (see its
+    // comment) did nothing while this line still shipped an empty
+    // allowlist on every response. AppPermissionManager plus the
+    // per-app permissionrequest gate in app-sandbox.js is the real,
+    // fine-grained enforcement point for these three — leaving self here
+    // lets same-origin sandboxed apps use the API at all, same reasoning
+    // as the meta tag fix. payment/usb have no corresponding permission
+    // type or IPC handler anywhere in the sandbox, so they stay disabled.
+    res.setHeader('Permissions-Policy', 'geolocation=(self), microphone=(self), camera=(self), payment=(), usb=()');
 
     // Origin-Agent-Cluster — set uniformly on every response to avoid the
     // browser warning about site-keyed vs origin-keyed agent clusters.

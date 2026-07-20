@@ -1,5 +1,42 @@
+// Shared network activity log, read by Perf Monitor's Network tab.
+//
+// Defined here at true top level (script-eval time), not inside init(),
+// unlike window.Downloads in gallery.js — that pattern only creates the
+// global once Gallery's window has actually been opened once, which is
+// fine for Downloads (browser.js only calls it after a download already
+// happened, well after Browser opened) but wrong for this log: Perf
+// Monitor could be opened before Browser, or Browser traffic could fire
+// before Perf Monitor ever opens, and neither app controls the other's
+// load order. A top-level definition means window.NetworkLog exists the
+// moment this script evaluates, regardless of which windows open when.
+//
+// Guarded with `window.NetworkLog ||` so re-including this script (or a
+// future core-relocation of this same object) doesn't clobber entries
+// already pushed.
+window.NetworkLog = window.NetworkLog || {
+  entries: [],
+  MAX_ENTRIES: 500, // ring buffer — a busy session could otherwise grow unbounded
+  _renderFn: null,  // set by Perf Monitor while its Network tab is visible
+
+  push(entry) {
+    this.entries.unshift(entry);
+    if (this.entries.length > this.MAX_ENTRIES) this.entries.length = this.MAX_ENTRIES;
+    this._renderFn?.();
+  },
+
+  getAll() {
+    return this.entries;
+  },
+
+  clear() {
+    this.entries.length = 0;
+    this._renderFn?.();
+  },
+};
+
 registerApp({
   id: 'browser', name: 'Browser', icon: 'globe',
+  version: '3.0.2',
   description: 'Web Browser',
   defaultSize: [900, 600], minSize: [500, 350],
 
@@ -126,7 +163,7 @@ registerApp({
 
       let result = favicon;
       // Already a proxy URL — use as-is
-      if (favicon.startsWith('/api/favicon') || favicon.startsWith('/api/email-image')) {
+      if (favicon.startsWith('/api/favicon')) {
         _faviconCache.set(cacheKey, favicon);
         return favicon;
       }
@@ -864,6 +901,16 @@ registerApp({
     toolbar.append(backBtn, fwdBtn, refreshBtn, urlBarWrap, starBtn, menuBtn);
 
     // ── View-mode toggle (Webview ↔ iFrame) ─────────────────────────────────
+/*****************************************************************
+ * ⚠️ DEV ONLY - DO NOT SHIP BUTTON TO PRODUCTION ⚠️
+ * * Dev/debug utility: lets a dev building on this app switch a tab
+ * between <webview> and <iframe> rendering — useful when <webview>
+ * isn't viable (e.g. missing nodeintegration/manifest flags) or
+ * when comparing how a tag behaves across the two modes.
+ * * REMOVE or HIDE this button element before deploying to production, 
+ * as non-technical/consumer people do not need this interface. 
+ * The underlying toggle logic is safe to leave in for devs.
+ *****************************************************************/
     const modeBtn = createEl('button', { className: 'browser-mode-btn', title: 'Switch to iframe mode' });
     modeBtn.innerHTML = svgIcon('monitor', 14) + ' <span>Webview</span>';
     modeBtn.addEventListener('click', () => {
@@ -1194,38 +1241,6 @@ registerApp({
 
     let currentUrl = '';
 
-    // ── Tracker blocklist ───────────────────────────────────────────────────
-    let TRACKER_DOMAINS = new Set();
-    fetch('/trackers.js')
-      .then(r => {
-        if (!r.ok) throw new Error('HTTP ' + r.status);
-        return r.text();
-      })
-      .then(src => {
-        let domains = null;
-        const arrayMatch = src.match(/new\s+Set\s*\(\s*(\[[\s\S]*?\])\s*\)/);
-        if (arrayMatch) {
-          try {
-            const parsed = JSON.parse(arrayMatch[1]);
-            if (Array.isArray(parsed)) domains = parsed.filter(d => typeof d === 'string' && d.length > 0);
-          } catch (parseErr) {
-            console.warn('[Tracker blocker] JSON.parse of Set array failed:', parseErr.message);
-          }
-        }
-        if (!domains) {
-          try {
-            const parsed = JSON.parse(src.trim());
-            if (Array.isArray(parsed)) domains = parsed.filter(d => typeof d === 'string' && d.length > 0);
-          } catch (_) {}
-        }
-        if (domains?.length) {
-          TRACKER_DOMAINS = new Set(domains);
-          console.log('[Tracker blocker] Loaded', TRACKER_DOMAINS.size, 'domains via fetch');
-        } else {
-          console.warn('[Tracker blocker] Fetched trackers.js but could not extract domain list');
-        }
-      })
-      .catch(e => console.warn('[Tracker blocker] Could not fetch /trackers.js —', e.message));
 
     const getTabMode = (tabId) => tabViewMode.get(tabId) || 'webview';
 
@@ -1317,6 +1332,15 @@ registerApp({
       wv.setAttribute('enableremotemodule', 'false');
       wv.setAttribute('sandbox', 'allow-scripts allow-same-origin allow-forms allow-popups');
       wv.style.cssText = 'width:100%;height:100%;border:none;flex:1;position:absolute;visibility:hidden;pointerEvents:none;z-index:0;top:0;left:0;';
+      // wv.request listeners (added below in _attachRequestListeners) run
+      // through NW.js's webRequest event system, which — unlike normal DOM
+      // addEventListener callbacks — does not reliably retain a closure
+      // over this function's local `tabId` parameter (confirmed: the
+      // pre-existing onBeforeRequest listener already avoided referencing
+      // any outer local for the same reason). Stashing it directly on the
+      // element sidesteps that: the element itself is what the listener
+      // closure captures, and property reads on it always work.
+      wv._nbTabId = tabId;
 
       wv.addEventListener('loadcommit', e => {
         if (e.isTopLevel && e.url) syncUrlForTab(e.url, tabId, 'loadcommit');
@@ -1575,16 +1599,16 @@ registerApp({
         const mgr = window.AppPermissionManager;
         if (!mgr) return true;
         const appId = 'browser';
-        if (mgr.isGranted('fs:write', appId)) return true;
-        if (mgr.isDenied?.('fs:write', appId)) {
+        if (mgr.isGranted('vfs:write', appId)) return true;
+        if (mgr.isDenied?.('vfs:write', appId)) {
           Notify.show({
             title: 'Download blocked',
-            body: 'Browser does not have permission to write files. Grant "fs:write" in Settings → Apps.',
+            body: 'Browser does not have permission to write files. Grant "vfs:write" in Settings → Apps.',
             type: 'error', appName: 'Browser',
           });
           return false;
         }
-        const granted = await mgr.requestPermission('fs:write', appId, {
+        const granted = await mgr.requestPermission('vfs:write', appId, {
           appName: 'Browser',
           reason: 'Browser needs to save downloaded files to your Downloads folder.',
         });
@@ -2009,6 +2033,61 @@ registerApp({
           );
         } catch (e) { /* wv.request not ready yet */ }
         // (Removed the dead no-op listener that always returned { cancel: false }.)
+
+        // Feed Perf Monitor's Network tab. wv.request lives per-<webview>
+        // (a genuinely separate NW.js/Chromium process from this document),
+        // so this is the only point in the codebase with visibility into
+        // Browser tab traffic — perf.js cannot reach it directly and reads
+        // from window.NetworkLog instead, same pattern as gallery.js's
+        // window.Downloads. onCompleted/onErrorOccurred give method, URL,
+        // status, type and timing — NOT response bodies; that requires
+        // CDP Network.getResponseBody, which nothing here wires up, so
+        // Browser-tab rows in the log intentionally never carry a body.
+        try {
+          wv.request.onCompleted.addListener(
+            (details) => {
+              const _tabId = wv._nbTabId;
+              const tab = tabs.find(t => t.id === _tabId);
+              window.NetworkLog?.push({
+                source: 'browser',
+                tabId: _tabId,
+                tabTitle: tab?.title || 'Tab ' + _tabId,
+                method: details.method,
+                url: details.url,
+                type: details.type,
+                statusCode: details.statusCode,
+                error: null,
+                // fromCache/timeStamp are what NW.js's webRequest actually
+                // provides; there is no per-request start time exposed on
+                // this event, so duration can't be computed honestly here —
+                // unlike the OS-level fetch/XHR patch in perf.js, which
+                // times its own requests directly.
+                fromCache: !!details.fromCache,
+                time: details.timeStamp || Date.now(),
+              });
+            },
+            { urls: ['<all_urls>'] }
+          );
+          wv.request.onErrorOccurred.addListener(
+            (details) => {
+              const _tabId = wv._nbTabId;
+              const tab = tabs.find(t => t.id === _tabId);
+              window.NetworkLog?.push({
+                source: 'browser',
+                tabId: _tabId,
+                tabTitle: tab?.title || 'Tab ' + _tabId,
+                method: details.method,
+                url: details.url,
+                type: details.type,
+                statusCode: null,
+                error: details.error || 'unknown error',
+                fromCache: false,
+                time: details.timeStamp || Date.now(),
+              });
+            },
+            { urls: ['<all_urls>'] }
+          );
+        } catch (e) { /* wv.request not ready yet */ }
       }
       wv.addEventListener('contentload', _attachRequestListeners);
       wv.addEventListener('loadcommit', _attachRequestListeners);
@@ -2591,7 +2670,7 @@ registerApp({
 
       // vault:// URL handling
       if (url.startsWith('vault:')) {
-        if (!AppPermissionManager?.isGranted('fs:write', 'browser')) {
+        if (!AppPermissionManager?.isGranted('vfs:write', 'browser')) {
           Notify.show({
             title: 'Permission denied', body: 'Browser needs fs:write to access vault files.',
             type: 'error', appName: 'Browser'
@@ -2802,19 +2881,6 @@ registerApp({
       omniDrop.style.display = 'block';
     }
 
-    async function fetchSuggestions(q, signal) {
-      const eng = getSetting('searchEngine', 'brave');
-      try {
-        const r = await fetch(
-          `/api/suggest?engine=${encodeURIComponent(eng)}&q=${encodeURIComponent(q)}`,
-          { signal }
-        );
-        if (!r.ok) return [];
-        const j = await r.json();
-        return j.suggestions || [];
-      } catch { return []; }
-    }
-
     async function omniQuery(raw) {
       const q = raw.trim();
       if (!q) { omniClose(); return; }
@@ -2836,27 +2902,6 @@ registerApp({
 
       if (gen !== omniGen) return; // a newer query / close superseded us
       omniRender([...bkItems, ...hxItems]);
-
-      // Skip remote fetch for single-char queries — results are noise
-      if (q.length < 2) return;
-
-      // Abort any in-flight request before starting a new one
-      if (omniController) omniController.abort();
-      omniController = new AbortController();
-
-      const suggestions = await fetchSuggestions(q, omniController.signal);
-
-      // Stale check AFTER the await: abort() rejects the fetch, but a result
-      // could still resolve just before a newer query fires. The generation
-      // guard is the only reliable way to drop it.
-      if (gen !== omniGen) return;
-
-      const sugItems = suggestions
-        .filter(s => !bkItems.some(b => b.label === s) && !hxItems.some(h => h.label === s))
-        .map(s => ({ type: 'suggest', label: s, url: null }));
-
-      if (gen !== omniGen) return; // final guard before paint
-      omniRender([...bkItems, ...hxItems, ...sugItems]);
     }
 
     // ── URL bar events ──────────────────────────────────────────────────────
@@ -2951,7 +2996,7 @@ registerApp({
 
     // ── Open HTML file from vault ───────────────────────────────────────────
     if (options?.fileId) {
-      if (!AppPermissionManager?.isGranted('fs:write', 'browser')) {
+      if (!AppPermissionManager?.isGranted('vfs:write', 'browser')) {
         Notify.show({
           title: 'Permission denied', body: 'Browser needs fs:write to open vault files.',
           type: 'error', appName: 'Browser'

@@ -1,7 +1,9 @@
 {
   "name": "novapack-studio",
-  "version": "1.1.61",
+  "version": "1.1.70",
   "description": "NovaByte App Development Studio",
+  "author": "NovaByteOfficial",
+  "license": "UNLICENSED",
   "main": "index.html",
   "window": {
     "title": "NovaByte Studio",
@@ -20,9 +22,7 @@
   "node-remote": "<all_urls>",
   "scripts": {
     "start": "nw .",
-    "build": "node studio-inject.js && node build.mjs",
-    "inject": "node studio-inject.js",
-    "inject:watch": "node studio-inject.js --watch",
+    "build": "node build.mjs",
     "bundle:editor": "esbuild src/ui/editor.js --bundle --format=iife --global-name=_CMLoaded --external:typescript --external:@typescript/vfs --outfile=src/ui/editor.bundle.js"
   },
   "dependencies": {

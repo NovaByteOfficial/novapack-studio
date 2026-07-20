@@ -146,6 +146,7 @@
   registerApp({
     id: 'nbosp-music',
     name: 'Music',
+    version: '3.0.2',
     icon: 'music',
     description: 'Music Player',
     defaultSize: [520, 520],
@@ -336,6 +337,16 @@
       // ---- Audio wiring ----
 
       audio.volume = clampVolume(parseFloat(volSlider.value));
+
+      if (typeof OS !== 'undefined' && OS.events && OS.events.on) {
+        OS.events.on('os:volumeChanged', function(evt) {
+          const vol = (evt && evt.volume !== undefined) ? evt.volume : 80;
+          audio.volume = clampVolume(vol / 100);
+          if (volSlider) volSlider.value = String(clampVolume(vol / 100));
+          prefs.volume = vol;
+          try { localStorage.setItem(PREFS_KEY, JSON.stringify(prefs)); } catch {}
+        });
+      }
 
       // Reflect playback state in the play/pause button label and ARIA.
       function syncPlayPauseLabel() {

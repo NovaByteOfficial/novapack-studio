@@ -1,6 +1,7 @@
 registerApp({
   id: 'calculator',
   name: 'Calculator',
+  version: '3.0.2',
   icon: 'calculator',
   description: 'High-efficiency, character-code driven arithmetic engine',
   defaultSize: [320, 440],
@@ -14,8 +15,7 @@ registerApp({
       return;
     }
 
-    // 0 = IDLE, 1 = EVALUATED
-    let bitState = 0;
+    let isEvaluated = false;
     let expr = '';
 
     // ── Allocation-Light Character-Code Parser ───────────────────────────────
@@ -33,7 +33,7 @@ registerApp({
         this.#skip();
 
         if (this.#i < this.#len) throw new SyntaxError();
-        // NaN check: v !== v; Infinity/-Infinity check explicit
+        // NaN check: v !== v; Infinity/-Infinity check (also catches ÷0)
         if (v !== v || v === Infinity || v === -Infinity) throw new RangeError();
         return v;
       }
@@ -86,33 +86,34 @@ registerApp({
         return decimals > 0 ? v / Math.pow(10, decimals) : v;
       }
 
-      #primary() {
-        if (this.#eat(43)) return  this.#primary(); // '+'
-        if (this.#eat(45)) return -this.#primary(); // '-'
+      #primary(depth = 0) {
+        if (depth > 1000) throw new SyntaxError();
+        if (this.#eat(43)) return  this.#primary(depth + 1); // '+'
+        if (this.#eat(45)) return -this.#primary(depth + 1); // '-'
         if (this.#eat(40)) {                        // '('
-          const v = this.#addSub();
+          const v = this.#addSub(depth);
           if (!this.#eat(41)) throw new SyntaxError(); // ')'
           return v;
         }
         return this.#num();
       }
 
-      #mulDiv() {
-        let v = this.#primary();
+      #mulDiv(depth = 0) {
+        let v = this.#primary(depth);
         while (this.#i < this.#len) {
-          if      (this.#eat(215)) v *= this.#primary(); // '×'
-          else if (this.#eat(247)) v /= this.#primary(); // '÷'
-          else if (this.#eat(37))  v %= this.#primary(); // '%'
+          if      (this.#eat(215)) v *= this.#primary(depth); // '×'
+          else if (this.#eat(247)) v /= this.#primary(depth); // '÷'
+          else if (this.#eat(37))  v %= this.#primary(depth); // '%'
           else break;
         }
         return v;
       }
 
-      #addSub() {
-        let v = this.#mulDiv();
+      #addSub(depth = 0) {
+        let v = this.#mulDiv(depth);
         while (this.#i < this.#len) {
-          if      (this.#eat(43)) v += this.#mulDiv(); // '+'
-          else if (this.#eat(45)) v -= this.#mulDiv(); // '-'
+          if      (this.#eat(43)) v += this.#mulDiv(depth); // '+'
+          else if (this.#eat(45)) v -= this.#mulDiv(depth); // '-'
           else break;
         }
         return v;
@@ -170,20 +171,20 @@ registerApp({
 
     const append = (v) => {
       const c = v.charCodeAt(0);
-      if (bitState === 1 && ((c >= 48 && c <= 57) || c === 46)) expr = '';
-      bitState = 0;
+      if (isEvaluated && ((c >= 48 && c <= 57) || c === 46)) expr = '';
+      isEvaluated = false;
       expr    += v;
       update();
     };
 
     const clearAll = () => {
       expr     = '';
-      bitState = 0;
+      isEvaluated = false;
       update();
     };
 
     const backspace = () => {
-      bitState = 0;
+      isEvaluated = false;
       expr     = expr.slice(0, -1);
       update();
     };
@@ -193,7 +194,7 @@ registerApp({
       try {
         const out = parser.evaluate(expr);
         expr     = String(out);
-        bitState = 1;
+        isEvaluated = true;
         display.value = expr;
         scrollEnd();
         setResult(expr);
@@ -277,8 +278,6 @@ registerApp({
         case '%': case '.': case '0': case '1': case '2': case '3':
         case '4': case '5': case '6': case '7': case '8': case '9':
           e.preventDefault(); append(k); break;
-        case '÷': e.preventDefault(); append('÷'); break;
-        case '×': e.preventDefault(); append('×'); break;
         case '−': e.preventDefault(); append('-'); break;
         case 'Enter': case '=': e.preventDefault(); equals(); break;
         case 'Backspace': e.preventDefault(); backspace(); break;
