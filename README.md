@@ -782,6 +782,40 @@ await window.nova.ipc('nova:dialog:save', {
 });
 ```
 
+### Styled file picker — `nova:sysdialog:*`
+
+A second, additional file-picker pair, separate from `nova:dialog:*` above and not a replacement for it — both keep working independently, so switching to this one is opt-in. Where `nova:dialog:*` renders its own minimal one-off overlay, `nova:sysdialog:*` opens the same shared, Files-app-styled VFS browser (`SystemDialogs`) that built-in apps like TextEdit use for Save As / Open — real folder navigation with back/up buttons and a path bar, an icon grid instead of a plain list, and no "save as type" dropdown (the payload already tells the host what kind of file this is; a type selector would be redundant). Same permissions as `nova:dialog:*` — `vfs:read` to open, `vfs:write` to save — this is a different *visual style* of the same capability, not a new one.
+
+```javascript
+// Open picker (requires vfs:read)
+const result = await window.nova.ipc('nova:sysdialog:open', {
+  title: 'Import',            // optional, defaults to "Open"
+  startFolderId: undefined,   // optional VFS folder id to start in; defaults to root
+});
+if (result.cancelled) {
+  // user backed out of the dialog — not an error
+} else {
+  const { id, name, content, mimeType, size, path } = result.file;
+}
+
+// Save picker (requires vfs:write) — writes the file itself once a
+// destination is chosen, then returns the new node's info.
+const result = await window.nova.ipc('nova:sysdialog:save', {
+  title: 'Save As',            // optional, defaults to "Save As"
+  suggestedName: 'notes.txt',  // optional, prefills the filename box
+  startFolderId: undefined,    // optional VFS folder id to start in; defaults to root
+  content: 'Hello',
+  mimeType: 'text/plain',      // optional, defaults to 'text/plain'
+});
+if (result.cancelled) {
+  // user backed out of the dialog — not an error
+} else {
+  const { id, name, path } = result.file;
+}
+```
+
+Both channels are on the same interactive, long-timeout tier as `nova:dialog:*` and `nova:download` — the call can legitimately sit open for minutes while a person navigates folders, so it won't hit the normal 30-second IPC timeout.
+
 ### Error codes
 
 `window.nova.ipc` rejects (throws) rather than resolving with an `{ error }` field — always wrap calls in `try/catch` or attach `.catch()`. The thrown error has `.code` and `.message` set:
