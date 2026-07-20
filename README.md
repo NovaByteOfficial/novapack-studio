@@ -786,7 +786,7 @@ Apps can declare a minimum OS security patch level required to run. The OS check
 
 If the user's OS patch is older than required, an unskippable dialog appears with a 6-second countdown and closes the window automatically. The user is directed to Settings → Updates. The dialog cannot be dismissed or bypassed.
 
-> **NovaByte OS v3 only:** an in-app trigger to re-check security compliance on demand is available via `window.parent.postMessage`. This is not available in NBOSP forks. If you need to gate a specific in-app action (like unlocking a vault) on OS patch level from inside your app, you can send a security check request and listen for the result:
+> **NovaByte OS v3 only:** an in-app trigger to re-check security compliance on demand is available via `window.parent.postMessage`. This call is silently ignored in NBOSP forks because the host runtime that handles it does not exist there. On NovaByte OS v3, if the check fails, the OS triggers an actual block — the blocking dialog appears and the window is closed automatically:
 
 ```javascript
 window.parent.postMessage({
