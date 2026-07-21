@@ -26,6 +26,27 @@
 
 ---
 
+> ### ⚠️ Read this before you build anything
+>
+> Two rules that live deep in the [Security](#security) section below cause almost all first-build failures. Save yourself the debugging loop:
+>
+> 1. **Reference your script, never inline it.** In `index.html`, use `<script src="app.js"></script>` — a local relative path to a sibling file. An inline `<script>...code...</script>` block with actual code inside it is flagged by the install-time content scanner and **blocks install outright, no exceptions.** See [Content Scanner](#content-scanner--avoiding-false-positives-on-install).
+> 2. **Wrap every `app.js` in a DOM-ready guard before writing anything else** — not after something breaks:
+>    ```javascript
+>    function main() {
+>      document.getElementById('pad').addEventListener('click', /* ... */);
+>      // rest of your DOM-touching setup
+>    }
+>    if (document.readyState === 'loading') {
+>      document.addEventListener('DOMContentLoaded', main);
+>    } else {
+>      main();
+>    }
+>    ```
+>    Skip this and you'll eventually hit `Uncaught TypeError: Cannot read properties of null (reading 'addEventListener')` — a script running before its target element exists in the DOM. It's cheap to set up front and costly to retrofit once a file's grown past a few elements. See [Best practices](#best-practices).
+
+---
+
 ## What is NovaByte Studio
 
 NovaByte Studio is a desktop IDE (built on NW.js) for creating, building, and packaging `.novaapp` applications. It gives you a GUI to scaffold new projects from templates, edit your code with a full-featured CodeMirror 6 editor, manage your manifest and permissions, build your package, and inspect the output — all without touching a CLI.
