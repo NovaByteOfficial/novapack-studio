@@ -152,7 +152,7 @@ Every app needs a `manifest.json` at the root of its directory.
 
 ### App ID format
 
-Use reverse domain name notation. The CLI enforces this.
+Use reverse domain name notation. Studio's manifest validation enforces this at Build time.
 
 ```
 ✅  com.example.myapp
@@ -540,13 +540,21 @@ Requires `net:websocket`. Don't call the raw `nova:net:websocket` / `nova:net:ws
 ```javascript
 const ws = await window.nova.websocket('wss://example.com/socket');
 
-ws.onMessage((msg) => console.log('received:', msg));
+// onMessage receives { wsId, data } — not the bare server message. `data`
+// is the raw string from the underlying WebSocket's own message event
+// (JSON.parse it yourself if the server sends JSON).
+ws.onMessage((envelope) => {
+  const data = JSON.parse(envelope.data);
+  console.log('received:', data);
+});
 ws.onError((err) => console.error('ws error:', err));
 ws.onClose(() => console.log('closed'));
 
 ws.send('hello');
 ws.close(1000, 'done');
 ```
+
+> **Don't skip this:** `onMessage`'s callback argument is `{wsId, data}`, not the raw message. Treating it as the bare payload is an easy mistake — it'll connect, subscribe, and receive real frames with no errors anywhere, while silently never firing your actual message-handling logic.
 
 The returned promise resolves once the connection is open. **Note:** it only resolves from the host's `onopen` handler — there's no host-side rejection path if the connection never opens (bad host, refused connection, TLS failure before handshake). In those cases the call just sits until the IPC layer's own timeout fires and rejects with a generic "IPC request timed out" error rather than a specific connection-failure reason. Treat that timeout as a real connection failure, not a hung guest.
 
