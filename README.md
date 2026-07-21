@@ -2,7 +2,7 @@
 
 <div><img src="./logo.svg" width="100" height="100" alt="NovaByte Logo" /></div>
 
-<div><img src="https://img.shields.io/badge/NovaByte_Studio-v1.1.70-22c55e?style=for-the-badge" alt="NovaByte Studio"/></div>
+<div><img src="https://img.shields.io/badge/NovaByte_Studio-v1.1.71-22c55e?style=for-the-badge" alt="NovaByte Studio"/></div>
 
 # NovaByte Studio
 
@@ -201,10 +201,26 @@ NovaByte Studio includes a full-featured CodeMirror 6 editor with:
 - **Resizable file tree rail** — drag to resize, collapse/expand, persisted width
 - **Pinned recent projects** — pin frequently-used projects to the top of the recents list
 - **Submission Queue** — track Trusted Signing submissions with pending/approved/rejected status
+- **Drag-and-drop file tree** — drag files/folders to reorganize your project structure directly in the sidebar
+- **Real-time file tree** — the sidebar tree updates automatically as files change on disk
+- **Permission tooltips** — hover any permission in the Permissions tab or in `manifest.json` to see its risk level and description
+- **Clean last build toggle** — automatically wipe the output `dist/` folder before each build from the Build tab
+- **Autosave** — configurable autosave for manifest.json and editor files: off, real-time (on change), built-in intervals (5s / 15s / 30s / 60s), or a custom interval
 
 ### Themes
 
 Eight total themes: seven built-in presets — NovaByte Dark, NovaByte Light, Midnight Blue, Amber, Nightshade, High Contrast, and Forest — plus a fully custom theme editor with per-CSS-variable color pickers and JSON import/export.
+
+### Autosave
+
+Studio includes flexible autosave options for both `manifest.json` and editor files. Choose from:
+
+- **Off** — manual save only (`Ctrl+S` / `Cmd+S`)
+- **Real-time** — save automatically on every change (debounced by 500ms)
+- **Built-in intervals** — auto-save every 5 seconds, 15 seconds, 30 seconds, or 60 seconds
+- **Custom interval** — set any interval you prefer (in seconds)
+
+Autosave state is persisted per-user and applies to all projects.
 
 ---
 

@@ -1471,6 +1471,9 @@ const AppSandbox = (() => {
     if (!AppPermissionManager.isGranted('admin:audit', app.id)) {
       return respondError(webview, 'nova:admin:audit', requestId, 'PERMISSION_DENIED', 'admin:audit permission required');
     }
+    if (!(await isAdminEnabledClient())) {
+      return respondError(webview, 'nova:admin:audit', requestId, 'PERMISSION_DENIED', 'This machine is not in admin mode — enable it in Settings first');
+    }
     const q = payload ?? {};
     const params = new URLSearchParams();
     for (const k of ['userId', 'action', 'resource', 'ipAddress', 'success', 'startDate', 'endDate', 'level', 'limit', 'offset']) {
@@ -1493,6 +1496,9 @@ const AppSandbox = (() => {
   async function handleAdminSystem({ payload, requestId, app, webview }) {
     if (!AppPermissionManager.isGranted('admin:system', app.id)) {
       return respondError(webview, 'nova:admin:system', requestId, 'PERMISSION_DENIED', 'admin:system permission required');
+    }
+    if (!(await isAdminEnabledClient())) {
+      return respondError(webview, 'nova:admin:system', requestId, 'PERMISSION_DENIED', 'This machine is not in admin mode — enable it in Settings first');
     }
     const action = payload?.action === 'set' ? 'set' : 'get';
     try {
@@ -1527,6 +1533,9 @@ const AppSandbox = (() => {
   async function handleAdminUsers({ payload, requestId, app, webview }) {
     if (!AppPermissionManager.isGranted('admin:users', app.id)) {
       return respondError(webview, 'nova:admin:users', requestId, 'PERMISSION_DENIED', 'admin:users permission required');
+    }
+    if (!(await isAdminEnabledClient())) {
+      return respondError(webview, 'nova:admin:users', requestId, 'PERMISSION_DENIED', 'This machine is not in admin mode — enable it in Settings first');
     }
     // No account system exists in this codebase — this maps to session
     // management (list/revoke), the closest real equivalent to "manage
@@ -2720,6 +2729,68 @@ const AppSandbox = (() => {
     showFileDialog('save', webview, 'nova:dialog:save', requestId, app, payload);
   }
 
+  // New, additional dialog pair: delegates to SystemDialogs — the same
+  // shared, Files-app-styled VFS browser that first-party apps (TextEdit,
+  // etc.) use. Kept entirely separate from handleDialogOpen/handleDialogSave
+  // above (the native-styled dialog), so existing .novaapp callers of
+  // nova:dialog:open/save are completely unaffected. Still gated behind the
+  // same vfs:read/vfs:write permissions as the native pair — this is a new
+  // *visual style* of the same capability, not a new capability.
+  async function handleSysDialogOpen({ payload, requestId, app, webview }) {
+    if (!AppPermissionManager.isGranted('vfs:read', app.id)) {
+      return respondError(webview, 'nova:sysdialog:open', requestId, 'PERMISSION_DENIED', 'vfs:read permission required');
+    }
+    if (typeof window.SystemDialogs === 'undefined') {
+      return respondError(webview, 'nova:sysdialog:open', requestId, 'UNAVAILABLE', 'SystemDialogs not loaded');
+    }
+    try {
+      const node = await window.SystemDialogs.open({
+        title: payload?.title,
+        startFolderId: payload?.startFolderId || FS.rootId,
+      });
+      if (!node) return respond(webview, 'nova:sysdialog:open', requestId, { cancelled: true });
+      respond(webview, 'nova:sysdialog:open', requestId, {
+        success: true,
+        file: {
+          id: node.id,
+          name: node.name,
+          content: node.content || '',
+          mimeType: node.mimeType || 'text/plain',
+          size: node.size || 0,
+          path: FS.getPath(node.id),
+        },
+      });
+    } catch (e) {
+      respondError(webview, 'nova:sysdialog:open', requestId, 'DIALOG_ERROR', e?.message || 'Dialog failed');
+    }
+  }
+
+  async function handleSysDialogSave({ payload, requestId, app, webview }) {
+    if (!AppPermissionManager.isGranted('vfs:write', app.id)) {
+      return respondError(webview, 'nova:sysdialog:save', requestId, 'PERMISSION_DENIED', 'vfs:write permission required');
+    }
+    if (typeof window.SystemDialogs === 'undefined') {
+      return respondError(webview, 'nova:sysdialog:save', requestId, 'UNAVAILABLE', 'SystemDialogs not loaded');
+    }
+    try {
+      const picked = await window.SystemDialogs.save({
+        title: payload?.title,
+        suggestedName: payload?.suggestedName || '',
+        startFolderId: payload?.startFolderId || FS.rootId,
+      });
+      if (!picked) return respond(webview, 'nova:sysdialog:save', requestId, { cancelled: true });
+      const content = payload?.content || '';
+      const mimeType = payload?.mimeType || 'text/plain';
+      const newNode = await FS.createFile(picked.folderId, picked.name, content, mimeType);
+      respond(webview, 'nova:sysdialog:save', requestId, {
+        success: true,
+        file: { id: newNode.id, name: newNode.name, path: FS.getPath(newNode.id) },
+      });
+    } catch (e) {
+      respondError(webview, 'nova:sysdialog:save', requestId, 'WRITE_ERROR', e?.message || 'Failed to write file');
+    }
+  }
+
   // Audit: eval
   //
   // Sent by the capability shim whenever an app calls eval(). We log it for
@@ -2810,6 +2881,8 @@ const AppSandbox = (() => {
     'nova:ready': handleReady,
     'nova:dialog:open': handleDialogOpen,
     'nova:dialog:save': handleDialogSave,
+    'nova:sysdialog:open': handleSysDialogOpen,
+    'nova:sysdialog:save': handleSysDialogSave,
     'nova:audit:eval': handleAuditEval,
     'nova:download': handleDownload,
   };
@@ -3071,6 +3144,8 @@ const AppSandbox = (() => {
     'nova:download': true,
     'nova:dialog:open': true,
     'nova:dialog:save': true,
+    'nova:sysdialog:open': true,
+    'nova:sysdialog:save': true,
   };
   const pendingRequests = new Map();
   // Must exactly match IPC_MARKER in app-sandbox.js's setupAPIBridge.

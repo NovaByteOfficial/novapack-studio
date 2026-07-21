@@ -66,6 +66,28 @@
     return FS.uniqueName(destParentId, name, excludeId);
   }
 
+  // Host-disk counterpart to FS.uniqueName, for exportToHost's bulk path.
+  // Same " (1)", " (2)"... convention, but driven by a plain Set of names
+  // already seen (populated from fs.readdir, then grown in-place as the
+  // batch claims names) instead of a VFS folder listing — there's no VFS
+  // node to check here, just plain strings.
+  function uniqueHostName(existingNames, name) {
+    if (!existingNames.has(name)) return name;
+
+    const dot = name.lastIndexOf('.');
+    const hasExt = dot > 0;
+    const base = hasExt ? name.slice(0, dot) : name;
+    const ext = hasExt ? name.slice(dot) : '';
+
+    let i = 1;
+    let candidate;
+    do {
+      candidate = `${base} (${i})${ext}`;
+      i++;
+    } while (existingNames.has(candidate));
+    return candidate;
+  }
+
   function mimeToTypeLabel(mimeType) {
     if (!mimeType) return 'FILE';
     const sub = mimeType.split('/')[1];
@@ -716,6 +738,21 @@
           },
         },
       ];
+      if (f.type === 'file') {
+        const selectedFileIds = new Set(
+          [...this.selectedIds].filter(id => {
+            const n = FS.files.get(id);
+            return n && n.type === 'file';
+          })
+        );
+        selectedFileIds.add(f.id);
+        const count = selectedFileIds.size;
+        items.push({
+          label: count > 1 ? `Export ${count} Files to Host…` : 'Export to Host…',
+          icon: 'download',
+          action: () => this.exportToHost([...selectedFileIds]),
+        });
+      }
       if (isHtmlFile(f)) {
         items.push({ label: 'Edit in Text Editor', icon: 'pen', action: () => WM.createWindow('quill', { fileId: f.id }) });
       }
@@ -826,6 +863,154 @@
       this.clipboardOp = { type: 'cut', fileId: f.id };
       OS.clipboard = this.clipboardOp;
       Notify.show({ title: 'Cut', body: f.name + ' ready to move', type: 'info', appName: 'Files' });
+    }
+
+    // Writes one or more VFS files' bytes out to the real host filesystem.
+    // This runs in the Files app's own top-level shell window (a real Node
+    // frame — unlike a .novaapp's sandboxed <webview>), so it can drive
+    // NW.js's native dialogs + Node's fs module directly instead of going
+    // through the nova:download IPC bridge that sandboxed apps need.
+    //
+    // Single file: a `nwsaveas` dialog, same as before — lets the user
+    // rename on the way out. nwsaveas delegates to the OS's own native
+    // save dialog, and every major desktop OS's native picker warns before
+    // overwriting an existing file by default — but that's the OS's
+    // behavior, not something this code verifies or controls.
+    // Multiple files: a single `nwdirectory` dialog picks one destination
+    // folder, then every file is written into it. Before writing, the
+    // destination folder is listed once (fs.readdir) so a name that
+    // already exists there — or that collides with another file in this
+    // same batch — gets suffixed " (1)", " (2)", etc., the same convention
+    // FS.uniqueName uses for the VFS. Nothing at the destination is ever
+    // silently overwritten.
+    async exportToHost(target) {
+      const ids = Array.isArray(target) ? target : [target.id];
+      const nodes = ids
+        .map(id => (typeof id === 'string' ? FS.files.get(id) : id))
+        .filter(n => n && n.type === 'file');
+      if (!nodes.length) return;
+
+      if (nodes.length === 1) {
+        const ok = await this.exportOneToHost(nodes[0]);
+        if (ok) {
+          Notify.show({ title: 'Exported', body: `${nodes[0].name} saved to host`, type: 'success', appName: 'Files' });
+        }
+        return;
+      }
+
+      const destDir = await this.pickHostDirectory();
+      if (!destDir) return; // user cancelled the folder picker
+
+      const path = require('path');
+      const fs = require('fs');
+
+      // One directory listing up front, rather than a stat-per-file — also
+      // lets us dedupe against names claimed earlier in this same loop.
+      let existingNames;
+      try {
+        existingNames = new Set(await new Promise((resolve, reject) => {
+          fs.readdir(destDir, (err, entries) => (err ? reject(err) : resolve(entries)));
+        }));
+      } catch (err) {
+        console.error('[Files] could not list destination directory:', err);
+        notifyError('Export failed', err);
+        return;
+      }
+
+      let saved = 0;
+      let failed = 0;
+      for (const node of nodes) {
+        let buffer;
+        try {
+          buffer = Buffer.from(node.content ?? '');
+        } catch {
+          failed++;
+          continue;
+        }
+        const finalName = uniqueHostName(existingNames, node.name);
+        existingNames.add(finalName); // claimed for the rest of this batch too
+        const destPath = path.join(destDir, finalName);
+        try {
+          // eslint-disable-next-line no-await-in-loop -- writes must not race each other under the same directory handle
+          await new Promise((resolve, reject) => {
+            fs.writeFile(destPath, buffer, (err) => (err ? reject(err) : resolve()));
+          });
+          saved++;
+        } catch (err) {
+          console.error('[Files] export failed for', node.name, err);
+          failed++;
+        }
+      }
+
+      const parts = [`${saved} saved`];
+      if (failed) parts.push(`${failed} failed`);
+      Notify.show({
+        title: 'Export complete', body: parts.join(', '),
+        type: failed && !saved ? 'error' : (failed ? 'warning' : 'success'),
+        appName: 'Files',
+      });
+    }
+
+    // Shows NW.js's native folder-choose dialog (nwdirectory — distinct
+    // from nwsaveas). Resolves the chosen absolute path, or null if the
+    // user cancelled.
+    pickHostDirectory() {
+      return new Promise((resolve) => {
+        const input = document.createElement('input');
+        input.type = 'file';
+        input.setAttribute('nwdirectory', '');
+        input.style.display = 'none';
+        document.body.appendChild(input);
+
+        const finish = (path) => { input.remove(); resolve(path); };
+
+        input.addEventListener('change', () => finish(input.value || null), { once: true });
+        input.addEventListener('cancel', () => finish(null), { once: true });
+
+        input.click();
+      });
+    }
+
+    // Exports a single file node via a native Save As dialog, resolving
+    // true on success, false on cancel/error. node.content is either a
+    // string (text files) or a Uint8Array (binary files dropped in from
+    // the host) — Buffer.from handles both.
+    exportOneToHost(node) {
+      return new Promise((resolve) => {
+        let buffer;
+        try {
+          buffer = Buffer.from(node.content ?? '');
+        } catch (err) {
+          notifyError('Export failed', err);
+          resolve(false);
+          return;
+        }
+
+        const input = document.createElement('input');
+        input.type = 'file';
+        input.setAttribute('nwsaveas', node.name || 'export');
+        input.style.display = 'none';
+        document.body.appendChild(input);
+
+        const finish = (ok) => { input.remove(); resolve(ok); };
+
+        input.addEventListener('change', () => {
+          const savePath = input.value;
+          if (!savePath) { finish(false); return; }
+          require('fs').writeFile(savePath, buffer, (err) => {
+            if (err) {
+              notifyError('Export failed', err);
+              finish(false);
+            } else {
+              finish(true);
+            }
+          });
+        }, { once: true });
+
+        input.addEventListener('cancel', () => finish(false), { once: true });
+
+        input.click();
+      });
     }
 
     // Restore from trash: persist first, then update the UI. If persistence
