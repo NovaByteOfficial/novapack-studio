@@ -967,7 +967,12 @@ window.addEventListener('message', (e) => {
 
 ### `eval()` auditing
 
-There's no permission gate on `eval()` — the CSP allows `unsafe-eval` by design, since some apps genuinely need it. Instead, the sandbox's own capability shim automatically reports every `eval()` call your app makes via the internal `nova:audit:eval` channel, which logs to `EventLog` (category `security`, severity `warn`) for visibility. This isn't an API your app calls itself — it fires automatically whenever `eval()` runs, purely for observability, and doesn't block execution.
+`eval()` faces two separate, independent checks — don't confuse one for the other:
+
+- **Install-time:** the Content Scanner flags literal `eval(` (and `new Function(`) outright as an obfuscation smell and can block install before your app ever runs. See [Content Scanner](#content-scanner--avoiding-false-positives-on-install) for what's actually flagged and how to avoid false positives.
+- **Runtime:** if your app makes it past the scanner (or calls `eval` indirectly in a way the scanner didn't catch, e.g. via `window['ev' + 'al']`), there's no permission gate at runtime — the CSP allows `unsafe-eval` by design, since some apps genuinely need it. Instead, the sandbox's own capability shim automatically reports every runtime `eval()` call via the internal `nova:audit:eval` channel, which logs to `EventLog` (category `security`, severity `warn`) for visibility. This isn't an API your app calls itself, and it doesn't block execution — it's observability, not enforcement.
+
+Practical takeaway: passing the runtime check isn't the bar — the scanner is the harder, earlier gate, and the best move is still to avoid `eval()` entirely rather than rely on either check.
 
 ### Best practices
 
