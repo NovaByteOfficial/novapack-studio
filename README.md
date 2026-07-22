@@ -265,6 +265,13 @@ Third-party apps run inside an NW.js `<webview>` element, not an iframe — a se
 
 `allow-same-origin` is **not** granted to third-party apps by default — only to an audited allowlist of first-party system apps. Granting it gives a guest access to cookies/localStorage/sessionStorage on the shared origin, which widens the impact of any XSS inside that app. If your app genuinely needs it, declare `sandbox: { allowSameOrigin: true }` in your manifest; expect this to require review before your app is verified.
 
+**Nested `<webview>` (in-app browsers):** if your app's own HTML/JS creates a `<webview>` element (e.g. to build a browser-style app — see the [Browser template](#templates)), that's gated separately and blocked by default. Any nested `<webview>` your app tries to create — via `document.createElement('webview')`, `innerHTML`, or `insertAdjacentHTML` — is silently stripped at runtime unless **both** of these are true:
+
+1. Your manifest declares `"allowNestedWebview": true` (a top-level manifest field, not nested under `sandbox`), **and**
+2. The user has granted the `sandbox:nested-webview` permission (declare it in `permissions` so it's requested at launch — see [Permissions](#permissions)).
+
+Both gates are required; declaring one without the other still gets you a stripped `<webview>`. This is `critical` risk since a nested `<webview>` is effectively a second, unsandboxed renderer surface — expect extra scrutiny if you're submitting for verification.
+
 ### Launch — window.nova bridge
 
 Before your app's HTML executes, the runtime injects `window.nova` into the guest's page. You don't need to request it, import it, or wait for a handshake — it's there as soon as your script runs:
@@ -294,7 +301,7 @@ Permissions are declared in `manifest.json` and checked before the app loads. Th
 
 ### Full permission list
 
-32 permissions across 8 categories. This mirrors `app-permission-manager.js` exactly — if you're hand-writing a manifest, these are the only strings `validateManifest` recognizes without a warning. (`data:export`/`data:backup`, previously listed here, don't exist as real permissions — they were dead metadata with no backing handler and have been removed from the OS entirely; the export feature in Settings isn't permission-gated.)
+32 permissions across 8 categories, plus one further permission (`sandbox:nested-webview`) in a 9th category — see the note below the table, since it works differently from the rest. This mirrors `app-permission-manager.js` exactly — if you're hand-writing a manifest, these are the only strings `validateManifest` recognizes without a warning. (`data:export`/`data:backup`, previously listed here, don't exist as real permissions — they were dead metadata with no backing handler and have been removed from the OS entirely; the export feature in Settings isn't permission-gated.)
 
 `vfs:metadata` is worth calling out specifically: it existed in the permission registry from the start, but the handler behind it (`nova:vfs:stat`) checked `vfs:read` instead — declaring `vfs:metadata` alone in a manifest silently did nothing. That's now fixed; `vfs:metadata` genuinely gates `nova:vfs:stat` on its own (an app with `vfs:read` still works too, since full read is a superset of metadata-only access).
 
@@ -334,6 +341,7 @@ Permissions are declared in `manifest.json` and checked before the app loads. Th
 | `admin:users` | Admin | Critical | Session monitors, force-logout tools (needs admin mode) |
 | `admin:system` | Admin | Critical | Security-policy dashboards, lockout/IP-block tuning (needs admin mode) |
 | `admin:audit` | Admin | High | Security/activity log viewers (needs admin mode) |
+| `sandbox:nested-webview` | Sandbox | Critical | Apps that create their own `<webview>` for in-app browsing (browser-style apps). Also requires `"allowNestedWebview": true` in the manifest — the permission alone does nothing. |
 
 `admin:*` additionally requires the machine itself to be in admin mode — a separate, local-only toggle in Settings → Privacy & Security → Admin Access. Granting an app one of the four `admin:*` permissions doesn't put the machine in admin mode by itself; both gates have to pass, or the call is denied with a message telling you the machine isn't in admin mode. `mail:*` requires an email account to already be connected via the Email app — there's no way for a sandboxed app to supply its own account credentials; `mail:*` always acts on whatever account the user has connected, and calls fail with a clear error if nothing's connected.
 
