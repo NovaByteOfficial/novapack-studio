@@ -367,6 +367,31 @@ const { granted } = await window.nova.ipc('nova:request-permission', {
 });
 ```
 
+#### Rate limiting
+
+Every call to `requestPermission` shows a live dialog again, even if the permission was previously denied — there's no persisted-denial short-circuit. That re-prompt-every-time behavior means a buggy or malicious app calling `requestPermission()` in a loop could otherwise spam the user with dialogs indefinitely, so requests for the same `appId:permission` pair are rate-limited:
+
+- Up to **3 prompts within a rolling 60-second window** are shown normally.
+- The next request in that window is **auto-denied with no dialog shown at all** (`granted` resolves to `false` immediately) and a cooldown starts.
+- The cooldown is **5 seconds base**, and **doubles for each consecutive denial** for that `appId:permission` pair, capped at **15 minutes**. A grant resets the denial streak back to zero.
+- Rate-limited requests are logged to `EventLog` (category `permissions`, severity `warn`) so they're visible for debugging, even though nothing is shown to the user.
+
+Your app can't tell the difference between "the user clicked deny" and "auto-denied by the rate limiter" just from `requestPermission`'s return value — both currently resolve `granted: false`.
+
+If you need to check cooldown status without triggering a new prompt (e.g. to show your own "please wait" UI), use the `nova:permission-rate-limited` channel:
+
+```javascript
+const status = await window.nova.ipc('nova:permission-rate-limited', {
+  permission: 'vfs:write',
+});
+// { limited: false }
+// or, mid-cooldown: { limited: true, retryAfterMs: 4213 }
+```
+
+There's no `window.nova.*` convenience wrapper for this one — call `nova.ipc` directly as shown above.
+
+Calling `resetPermission` clears both the grant and any rate-limit cooldown state for that `appId:permission` pair.
+
 ---
 
 ## Private Storage
@@ -736,6 +761,20 @@ const info = await window.nova.ipc('nova:system:info', {});
 // { osVersion, securityPatch, platform, ... }
 ```
 
+### Settings — `nova:settings:get` / `nova:settings:set`
+
+Read and write arbitrary OS-level settings keys. Get and set are gated by **different** permissions — reading a settings value only requires `system:info` (the same low-risk permission that gates `nova:system:info` above), while writing requires `system:settings`:
+
+```javascript
+// Requires system:info
+const { value } = await window.nova.ipc('nova:settings:get', { key: 'theme' });
+
+// Requires system:settings
+await window.nova.ipc('nova:settings:set', { key: 'theme', value: 'dark' });
+```
+
+This is a shared, OS-wide key space, not per-app storage — if you want isolated data scoped to your own app, use [Private Storage](#private-storage) (`nova:storage:*`) instead.
+
 ### Event bus — `nova:events:*`
 
 Use `window.nova.onEvent`, which handles the subscribe call and dispatches pushed events to your callback:
@@ -925,6 +964,10 @@ window.addEventListener('message', (e) => {
   }
 });
 ```
+
+### `eval()` auditing
+
+There's no permission gate on `eval()` — the CSP allows `unsafe-eval` by design, since some apps genuinely need it. Instead, the sandbox's own capability shim automatically reports every `eval()` call your app makes via the internal `nova:audit:eval` channel, which logs to `EventLog` (category `security`, severity `warn`) for visibility. This isn't an API your app calls itself — it fires automatically whenever `eval()` runs, purely for observability, and doesn't block execution.
 
 ### Best practices
 
