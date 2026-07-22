@@ -970,9 +970,11 @@ window.addEventListener('message', (e) => {
 `eval()` faces two separate, independent checks — don't confuse one for the other:
 
 - **Install-time:** the Content Scanner flags literal `eval(` (and `new Function(`) outright as an obfuscation smell and can block install before your app ever runs. See [Content Scanner](#content-scanner--avoiding-false-positives-on-install) for what's actually flagged and how to avoid false positives.
-- **Runtime:** if your app makes it past the scanner (or calls `eval` indirectly in a way the scanner didn't catch, e.g. via `window['ev' + 'al']`), there's no permission gate at runtime — the CSP allows `unsafe-eval` by design, since some apps genuinely need it. Instead, the sandbox's own capability shim automatically reports every runtime `eval()` call via the internal `nova:audit:eval` channel, which logs to `EventLog` (category `security`, severity `warn`) for visibility. This isn't an API your app calls itself, and it doesn't block execution — it's observability, not enforcement.
+- **Runtime:** no longer includes `unsafe-eval` — `eval()` and `new Function()` are blocked by the browser at runtime, full stop, regardless of how they're invoked (including indirect forms like `window['ev' + 'al']` that could slip past the install-time scanner's literal-text check). There is no legitimate runtime path to dynamic code execution anymore. The sandbox's capability shim still reports any attempted call via the internal `nova:audit:eval` channel, logging to `EventLog` (category `security`, severity `warn`) — this is kept for observability and back-compat, but in practice the CSP will have already thrown before the app's `eval()` call does anything.
 
-Practical takeaway: passing the runtime check isn't the bar — the scanner is the harder, earlier gate, and the best move is still to avoid `eval()` entirely rather than rely on either check.
+  Note this runtime CSP is actually enforced from **two independent places**, both stripped of `unsafe-eval`: the client-side `RELAXED_CSP_META` meta tag injected by `app-sandbox.js`, and the server-sent `Content-Security-Policy` header set by the `/api/apps/serve/:sandboxId/*` route in `index.js` that actually serves packaged app files. The header is at least as authoritative as the meta tag — it's set before the browser even parses the HTML — so both had to be patched for the fix to be complete.
+
+Practical takeaway: both gates now actually block. The scanner stops the obvious case at install time; the CSP — enforced identically at both the header and meta-tag level — stops everything else — obfuscated or dynamic constructions included — at runtime. There's no supported way for an app to use `eval()` or `new Function()` in this sandbox.
 
 ### Best practices
 
