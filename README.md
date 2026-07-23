@@ -263,7 +263,12 @@ Before the app loads, the runtime checks every permission in `permissions` again
 
 Third-party apps run inside an NW.js `<webview>` element, not an iframe — a separate renderer process, not a same-document sandbox. There is no `window.parent`/`contentWindow` reference between the guest and the host (a `<webview>` guest's `window.parent` is just itself), so the two sides can't reach each other via ordinary DOM references or `postMessage`. Communication with the OS happens exclusively through `window.nova`, described below.
 
-`allow-same-origin` is **not** granted to third-party apps by default — only to an audited allowlist of first-party system apps. Granting it gives a guest access to cookies/localStorage/sessionStorage on the shared origin, which widens the impact of any XSS inside that app. If your app genuinely needs it, declare `sandbox: { allowSameOrigin: true }` in your manifest; expect this to require review before your app is verified.
+`allow-same-origin` is **not** granted to third-party apps by default — only to an audited allowlist of first-party system apps (exempted by app id, not by holding any permission). Granting it to a third-party app gives its guest content access to cookies/localStorage/sessionStorage on the shared origin, which widens the impact of any XSS inside that app. If your app genuinely needs it, **both** of these must be true, or `sanitizeSandboxAttr()` strips it and your webview runs without it:
+
+1. Your manifest declares `sandbox: { allowSameOrigin: true }`, **and**
+2. The user has granted the `sandbox:same-origin` permission (declare it in `permissions` so it's requested at launch — see [Permissions](#permissions)).
+
+Declaring the manifest flag without the permission (or vice versa) still gets you a sandbox with no `allow-same-origin`. This is `high` risk — expect it to draw extra scrutiny before your app is verified.
 
 **Nested `<webview>` (in-app browsers):** if your app's own HTML/JS creates a `<webview>` element (e.g. to build a browser-style app — see the [Browser template](#templates)), that's gated separately and blocked by default. Any nested `<webview>` your app tries to create — via `document.createElement('webview')`, `innerHTML`, or `insertAdjacentHTML` — is silently stripped at runtime unless **both** of these are true:
 
