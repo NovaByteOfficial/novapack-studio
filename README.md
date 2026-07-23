@@ -270,6 +270,10 @@ Third-party apps run inside an NW.js `<webview>` element, not an iframe — a se
 
 Declaring the manifest flag without the permission (or vice versa) still gets you a sandbox with no `allow-same-origin`. This is `high` risk — expect it to draw extra scrutiny before your app is verified.
 
+**Without this permission, raw browser storage does not survive relaunch.** `allow-same-origin` isn't just about *access* while your app is running — a guest page can always call `localStorage.setItem()`/set cookies regardless of this permission, since the sandbox attribute doesn't disable those APIs. What the permission actually controls is whether that data is kept on the next launch: when your app's window closes, the OS clears its storage partition unless it holds a live `sandbox:same-origin` grant at that moment. So without the permission, any raw `localStorage`/cookie values your app writes are wiped as soon as it closes — they'll be gone on the next open, even though reads/writes work fine within a single session. This applies every time the app is fully closed (not backgrounded via `stayAliveInBackground()`), so a revoked grant takes effect the next time the app closes, not immediately.
+
+If your app just needs data to survive across launches — settings, save state, caches — and doesn't need real same-origin semantics (postMessage origin-matching, sharing cookies with the host), don't request `sandbox:same-origin` for this. Use [`nova:storage:*`](#storage-novastorage) instead: it's durable by default, requires no permission, and isn't affected by this at all.
+
 **Nested `<webview>` (in-app browsers):** if your app's own HTML/JS creates a `<webview>` element (e.g. to build a browser-style app — see the [Browser template](#templates)), that's gated separately and blocked by default. Any nested `<webview>` your app tries to create — via `document.createElement('webview')`, `innerHTML`, or `insertAdjacentHTML` — is silently stripped at runtime unless **both** of these are true:
 
 1. Your manifest declares `"allowNestedWebview": true` (a top-level manifest field, not nested under `sandbox`), **and**
@@ -296,7 +300,7 @@ console.log(info.permissions, info.optionalPermissions);
 
 `window.fetch` and `XMLHttpRequest` inside your app are also transparently routed through this bridge — plain `fetch(url, opts)` calls work as expected and don't need to be rewritten to use `nova.ipc` directly, as long as the relevant `net:*` permission is granted.
 
-There is no `window.__novaPrivateStore` — for isolated, namespaced storage, use `nova:storage:*` (see [Storage](#storage-novastorage) below), which is backed by the host, not raw `localStorage` inside the guest.
+There is no `window.__novaPrivateStore` — for isolated, namespaced storage, use `nova:storage:*` (see [Storage](#storage-novastorage) below), which is backed by the host, not raw `localStorage` inside the guest. Host-backed storage is always durable across launches regardless of permissions — raw `localStorage`/cookies inside the guest are not (see [Launch — sandbox](#launch--sandbox)).
 
 ---
 
